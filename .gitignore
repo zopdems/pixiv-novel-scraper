@@ -1,0 +1,5 @@
+# 打包输出
+build/
+dist/
+*.exe
+*.pkg
