@@ -5,7 +5,7 @@ from dataclasses import asdict
 from .. import credentials
 from ..config import ProxyConfig, Settings, save_settings
 
-BACKUP_VERSION = 1
+BACKUP_VERSION = 2
 
 
 def export_backup(path: str, settings: Settings, authors: list, cookie: str) -> None:
@@ -19,6 +19,7 @@ def export_backup(path: str, settings: Settings, authors: list, cookie: str) -> 
                 "author_id": a["author_id"],
                 "author_name": a.get("author_name") or "",
                 "enabled": int(a.get("enabled", 1)),
+                "kind": a.get("kind") or "novel",
             }
             for a in authors
         ],
@@ -48,9 +49,10 @@ def import_backup(path: str, db) -> dict:
         aid = str(a.get("author_id") or "").strip()
         if not aid.isdigit():
             continue
-        if db.add_author(aid, a.get("author_name") or ""):
+        kind = a.get("kind") if a.get("kind") in ("novel", "illust") else "novel"
+        if db.add_author(aid, a.get("author_name") or "", kind=kind):
             added += 1
-        db.set_author_enabled(aid, bool(a.get("enabled", 1)))
+        db.set_author_enabled(aid, bool(a.get("enabled", 1)), kind=kind)
 
     cookie = (payload.get("cookie") or "").strip()
     if cookie:

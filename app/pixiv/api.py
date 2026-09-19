@@ -29,16 +29,22 @@ class SeriesContent:
     novel_ids: list = field(default_factory=list)
 
 
-def get_user_novel_ids(client: PixivClient, user_id: str) -> list:
+def get_user_profile_ids(client: PixivClient, user_id: str) -> tuple:
     data = client.get_json(f"{client.BASE}/ajax/user/{user_id}/profile/all?lang=zh")
     body = data.get("body") or {}
-    novels = body.get("novels") or {}
-    if isinstance(novels, dict):
-        raw = novels.keys()
-    else:
-        raw = novels
-    ids = [str(nid) for nid in raw if str(nid).isdigit()]
-    return sorted(ids, key=int)
+
+    def _pick(key):
+        group = body.get(key) or {}
+        raw = group.keys() if isinstance(group, dict) else group
+        return {str(x) for x in raw if str(x).isdigit()}
+
+    novel_ids = _pick("novels")
+    illust_ids = _pick("illusts") | _pick("manga")
+    return sorted(novel_ids, key=int), sorted(illust_ids, key=int)
+
+
+def get_user_novel_ids(client: PixivClient, user_id: str) -> list:
+    return get_user_profile_ids(client, user_id)[0]
 
 
 def get_user_name(client: PixivClient, user_id: str) -> str:
@@ -130,3 +136,61 @@ def get_insert_illusts(client: PixivClient, novel_id: str, illust_ids: list) -> 
 
 def download_image(client: PixivClient, url: str) -> bytes:
     return client.download_binary(url, referer=f"{client.BASE}/")
+
+
+@dataclass
+class IllustMeta:
+    illust_id: str
+    title: str
+    author_id: str
+    author_name: str
+    description: str
+    tags: list
+    x_restrict: int
+    create_date: str
+    upload_date: str
+    page_count: int
+    illust_type: int = 0
+
+
+def get_user_illust_ids(client: PixivClient, user_id: str) -> list:
+    return get_user_profile_ids(client, user_id)[1]
+
+
+def get_illust_detail(client: PixivClient, illust_id: str) -> IllustMeta:
+    data = client.get_json(f"{client.BASE}/ajax/illust/{illust_id}?lang=zh")
+    body = data.get("body") or {}
+    if not body.get("id") and not body.get("illustId"):
+        raise PixivRequestError("作品不存在或已被删除", kind="not_found")
+    tags_raw = (body.get("tags") or {}).get("tags") or []
+    tags = [t.get("tag", "") for t in tags_raw if isinstance(t, dict) and t.get("tag")]
+    return IllustMeta(
+        illust_id=str(body.get("id") or body.get("illustId") or illust_id),
+        title=body.get("title") or "",
+        author_id=str(body.get("userId") or ""),
+        author_name=body.get("userName") or "",
+        description=body.get("description") or "",
+        tags=tags,
+        x_restrict=int(body.get("xRestrict") or 0),
+        create_date=body.get("createDate") or "",
+        upload_date=body.get("uploadDate") or body.get("createDate") or "",
+        page_count=int(body.get("pageCount") or 1),
+        illust_type=int(body.get("illustType") or 0),
+    )
+
+
+def get_illust_page_urls(client: PixivClient, illust_id: str) -> list:
+    data = client.get_json(f"{client.BASE}/ajax/illust/{illust_id}/pages?lang=zh")
+    body = data.get("body") or []
+    urls = []
+    for page in body:
+        url = ((page or {}).get("urls") or {}).get("original") or ""
+        if url:
+            urls.append(url)
+    if not urls:
+        raise PixivRequestError("接口未返回图片地址", kind="parse")
+    return urls
+
+
+def download_illust_image(client: PixivClient, url: str, illust_id: str) -> bytes:
+    return client.download_binary(url, referer=f"{client.BASE}/artworks/{illust_id}")

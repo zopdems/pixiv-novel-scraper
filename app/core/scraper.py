@@ -12,7 +12,7 @@ from ..pixiv.markup import convert_novel_markup
 from . import paths
 from .db import Database
 from .epub_exporter import build_epub
-from .md_index import write_author_md
+from .md_index import write_author_md, write_illust_md
 from .models import Status
 
 
@@ -25,6 +25,11 @@ class RunReport:
     skipped_count: int = 0
     failed_count: int = 0
     deleted_count: int = 0
+    illust_new: int = 0
+    illust_updated: int = 0
+    illust_skipped: int = 0
+    illust_failed: int = 0
+    illust_deleted: int = 0
     aborted_reason: str = ""
     per_author: dict = field(default_factory=dict)
 
@@ -58,12 +63,16 @@ class ScraperEngine:
             pass
 
     def _check_disk(self) -> bool:
-        root = self.settings.epub_root
-        if not root:
-            return False
-        drive = os.path.splitdrive(os.path.abspath(root))[0] + os.sep
-        free_mb = shutil.disk_usage(drive).free / (1024 * 1024)
-        return free_mb >= self.settings.disk_threshold_mb
+        threshold = self.settings.disk_threshold_mb
+        roots = {self.settings.epub_root, paths.illust_root(self.settings)}
+        for root in roots:
+            if not root:
+                continue
+            drive = os.path.splitdrive(os.path.abspath(root))[0] + os.sep
+            free_mb = shutil.disk_usage(drive).free / (1024 * 1024)
+            if free_mb < threshold:
+                return False
+        return True
 
     def run(self) -> RunReport:
         self.report.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -75,11 +84,15 @@ class ScraperEngine:
                 return self.report
             try:
                 self._migrate_filenames()
+                self._migrate_illust_paths()
                 self._retry_failed_queue()
-                authors = self.db.list_authors(enabled_only=True)
-                for author in authors:
+                self._retry_failed_illusts()
+                for author in self.db.list_authors(enabled_only=True, kind="novel"):
                     self._guard_failures()
                     self._process_author(author)
+                for author in self.db.list_authors(enabled_only=True, kind="illust"):
+                    self._guard_failures()
+                    self._process_illust_author(author)
             except AuthExpiredError:
                 self.report.aborted_reason = "登录已失效，请重新导入 Cookie"
                 self.logger.error(self.report.aborted_reason)
@@ -89,9 +102,11 @@ class ScraperEngine:
             self.client.close()
             self.report.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
             self.logger.info(
-                "任务结束：新增 %d，更新 %d，跳过 %d，失败 %d",
+                "任务结束：小说 新增 %d / 更新 %d / 跳过 %d / 失败 %d；图片 新增 %d / 更新 %d / 失败 %d",
                 self.report.new_count, self.report.updated_count,
                 self.report.skipped_count, self.report.failed_count,
+                self.report.illust_new, self.report.illust_updated,
+                self.report.illust_failed,
             )
         return self.report
 
@@ -114,7 +129,9 @@ class ScraperEngine:
 
     def _process_author(self, author: dict):
         aid = author["author_id"]
-        stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0, "deleted": 0}
+        stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0, "deleted": 0,
+                "illust_new": 0, "illust_updated": 0, "illust_skipped": 0,
+                "illust_failed": 0, "illust_deleted": 0}
         self.report.per_author[aid] = stat
         self._emit("author_start", author_id=aid, author_name=author.get("author_name") or aid)
         try:
@@ -126,7 +143,8 @@ class ScraperEngine:
                         author["author_name"] = name
                 except Exception:
                     self.logger.warning("作者 %s 昵称补拉失败", aid, exc_info=True)
-            remote_ids = set(api.get_user_novel_ids(self.client, aid))
+            remote_ids, _ = api.get_user_profile_ids(self.client, aid)
+            remote_ids = set(remote_ids)
         except AuthExpiredError:
             raise
         except PixivRequestError as e:
@@ -138,20 +156,19 @@ class ScraperEngine:
                 )
             else:
                 stat["failed"] += 1
-                self.report.failed_count += 1
                 self.logger.error("作者 %s 作品列表获取失败：%s", aid, e)
+            self.report.failed_count += stat["failed"]
             return
         except Exception as e:
             stat["failed"] += 1
-            self.report.failed_count += 1
             self.logger.error("作者 %s 作品列表获取失败：%s", aid, e)
+            self.report.failed_count += stat["failed"]
             return
 
         local_map = {n["novel_id"]: n for n in self.db.novels_by_author(aid)}
         for nid, rec in local_map.items():
             if nid not in remote_ids and rec["status"] in (Status.OK, Status.OUTDATED):
                 self.db.set_novel_status(nid, Status.DELETED)
-                self.report.deleted_count += 1
                 stat["deleted"] += 1
                 self.logger.info("作品 %s 远端已删除，本地保留", nid)
 
@@ -190,13 +207,20 @@ class ScraperEngine:
             self.logger.info("作者 %s 昵称变更：%s -> %s，迁移文件至新目录", aid, author.get("author_name"), remote_name)
             self.db.update_author_name(aid, remote_name)
             self._migrate_filenames()
+            self._migrate_illust_paths()
 
-        self.db.touch_author_fetch(aid)
+        self.db.touch_author_fetch(aid, kind="novel")
         self._refresh_author_md(aid, stat)
         self.report.new_count += stat["new"]
         self.report.updated_count += stat["updated"]
         self.report.skipped_count += stat["skipped"]
         self.report.failed_count += stat["failed"]
+        self.report.deleted_count += stat["deleted"]
+        self.report.illust_new += stat["illust_new"]
+        self.report.illust_updated += stat["illust_updated"]
+        self.report.illust_skipped += stat["illust_skipped"]
+        self.report.illust_failed += stat["illust_failed"]
+        self.report.illust_deleted += stat["illust_deleted"]
         self._emit("author_done", author_id=aid, **stat)
 
     def _migrate_filenames(self):
@@ -219,6 +243,255 @@ class ScraperEngine:
                     pass
             except OSError:
                 self.logger.warning("文件重命名失败：%s", old, exc_info=True)
+
+    # ---------------- 插画/漫画 ----------------
+    def _process_illust_author(self, author: dict):
+        aid = author["author_id"]
+        stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0, "deleted": 0,
+                "illust_new": 0, "illust_updated": 0, "illust_skipped": 0,
+                "illust_failed": 0, "illust_deleted": 0}
+        self._emit("author_start", author_id=aid, author_name=author.get("author_name") or aid)
+        try:
+            if author.get("pending_validate") or not author.get("author_name"):
+                try:
+                    name = api.get_user_name(self.client, aid)
+                    if name:
+                        self.db.update_author_name(aid, name)
+                        author["author_name"] = name
+                except Exception:
+                    self.logger.warning("作者 %s 昵称补拉失败", aid, exc_info=True)
+            _, remote_illust_ids = api.get_user_profile_ids(self.client, aid)
+            remote_illust_ids = set(remote_illust_ids)
+        except AuthExpiredError:
+            raise
+        except PixivRequestError as e:
+            if e.kind == "not_found":
+                self.db.set_author_enabled(aid, False, kind="illust")
+                self.logger.warning("作者 %s 账号已注销或不存在（404），插画名单已自动停用", aid)
+                if not self.report.aborted_reason:
+                    self.report.aborted_reason = f"作者 {aid} 账号已注销或不存在，插画名单已自动停用"
+            else:
+                stat["illust_failed"] += 1
+                self.logger.error("作者 %s 插画列表获取失败：%s", aid, e)
+            self._report_illust_stat(stat)
+            return
+        except Exception as e:
+            stat["illust_failed"] += 1
+            self.logger.error("作者 %s 插画列表获取失败：%s", aid, e)
+            self._report_illust_stat(stat)
+            return
+
+        self._process_author_illusts(author, remote_illust_ids, stat)
+
+        recs = self.db.illusts_by_author(aid)
+        remote_name = next((r["author_name"] for r in recs if r.get("author_name")), "")
+        if remote_name and remote_name != (author.get("author_name") or ""):
+            self.logger.info("作者 %s 昵称变更：%s -> %s，迁移图片至新目录", aid, author.get("author_name"), remote_name)
+            self.db.update_author_name(aid, remote_name)
+            self._migrate_illust_paths()
+            self._migrate_filenames()
+
+        self.db.touch_author_fetch(aid, kind="illust")
+        self._refresh_author_md(aid, stat)
+        self._report_illust_stat(stat)
+        self._emit("author_done", author_id=aid, **stat)
+
+    def _report_illust_stat(self, stat: dict):
+        self.report.illust_new += stat["illust_new"]
+        self.report.illust_updated += stat["illust_updated"]
+        self.report.illust_skipped += stat["illust_skipped"]
+        self.report.illust_failed += stat["illust_failed"]
+        self.report.illust_deleted += stat["illust_deleted"]
+
+    def _illust_ext(self, rec: dict) -> str:
+        old = rec.get("local_path") or ""
+        ext = os.path.splitext(old)[1]
+        return ext if ext else ".jpg"
+
+    def _migrate_illust_paths(self):
+        root = paths.illust_root(self.settings)
+        for rec in self.db.ok_illusts():
+            old = rec.get("local_path") or ""
+            if not old or not os.path.exists(old):
+                continue
+            desired = paths.illust_path(root, rec, self._illust_ext(rec))
+            if os.path.abspath(desired) == os.path.abspath(old):
+                continue
+            try:
+                os.makedirs(os.path.dirname(desired), exist_ok=True)
+                os.rename(old, desired)
+                self.db.upsert_illust({"illust_id": rec["illust_id"], "local_path": desired})
+                self.logger.info("图片迁移：%s -> %s", os.path.basename(old), os.path.basename(desired))
+                try:
+                    os.removedirs(os.path.dirname(old))
+                except OSError:
+                    pass
+            except OSError:
+                self.logger.warning("图片迁移失败：%s", old, exc_info=True)
+
+    def _retry_failed_illusts(self):
+        queue = [i for i in self.db.failed_illusts() if i["status"] != Status.FAILED_AUTH]
+        if not queue:
+            return
+        self.logger.info("优先重试失败图片：%d 幅", len(queue))
+        stat = {"illust_new": 0, "illust_updated": 0, "illust_skipped": 0,
+                "illust_failed": 0, "illust_deleted": 0}
+        for item in queue:
+            self._guard_failures()
+            self._process_illust(item["illust_id"], item["author_id"], stat)
+        self.report.illust_new += stat["illust_new"]
+        self.report.illust_updated += stat["illust_updated"]
+        self.report.illust_skipped += stat["illust_skipped"]
+        self.report.illust_failed += stat["illust_failed"]
+        self.report.illust_deleted += stat["illust_deleted"]
+
+    def _process_author_illusts(self, author: dict, remote_ids: set, stat: dict):
+        aid = author["author_id"]
+        local_map = {i["illust_id"]: i for i in self.db.illusts_by_author(aid)}
+        for iid, rec in local_map.items():
+            if iid not in remote_ids and rec["status"] in (Status.OK, Status.OUTDATED):
+                self.db.set_illust_status(iid, Status.DELETED)
+                stat["illust_deleted"] += 1
+                self.logger.info("图片 %s 远端已删除，本地保留", iid)
+
+        missing = [
+            iid for iid, rec in local_map.items()
+            if rec["status"] == Status.OK and not (rec.get("local_path") and os.path.exists(rec["local_path"]))
+        ]
+        if missing:
+            self.logger.info("作者 %s 有 %d 幅图片本地文件缺失，重新下载", aid, len(missing))
+        queue = sorted(set(missing) | {iid for iid in remote_ids if iid not in local_map}, key=int)
+        for iid in queue:
+            self._guard_failures()
+            self._process_illust(iid, aid, stat)
+
+    def _process_illust(self, illust_id: str, author_id: str, stat: dict):
+        try:
+            meta = api.get_illust_detail(self.client, illust_id)
+        except PixivRequestError as e:
+            if e.kind == "not_found":
+                self.db.set_illust_status(illust_id, Status.DELETED)
+                self.logger.info("图片 %s 远端已删除，本地保留", illust_id)
+                return
+            self._mark_illust_failed(illust_id, author_id, e)
+            stat["illust_failed"] += 1
+            return
+        except RiskControlError as e:
+            self._mark_illust_failed(illust_id, author_id, e, Status.FAILED_403)
+            stat["illust_failed"] += 1
+            return
+
+        existing = self.db.get_illust(illust_id)
+        if not self.settings.r18_enabled and meta.x_restrict > 0:
+            self.logger.info("图片 %s 为 R-18，按设置跳过", illust_id)
+            stat["illust_skipped"] += 1
+            return
+        blacklist = {t.strip() for t in self.settings.tag_blacklist if t.strip()}
+        if blacklist and blacklist.intersection(meta.tags):
+            self.logger.info("图片 %s 命中标签黑名单，跳过下载", illust_id)
+            self._index_illust(meta, existing, Status.SKIPPED)
+            stat["illust_skipped"] += 1
+            return
+
+        if existing and existing["status"] == Status.OK:
+            remote_ts = meta.upload_date
+            local_ts = existing.get("remote_updated_at") or ""
+            local_file = existing.get("local_path") or ""
+            if remote_ts and local_ts and remote_ts <= local_ts and local_file and os.path.exists(local_file):
+                stat["illust_skipped"] += 1
+                return
+
+        is_update = existing is not None
+        try:
+            urls = api.get_illust_page_urls(self.client, illust_id)
+            if len(urls) < meta.page_count:
+                meta.page_count = len(urls)
+            rec = self._index_illust(meta, existing, Status.OK)
+            root = paths.illust_root(self.settings)
+            blobs = []
+            for idx, url in enumerate(urls):
+                blob = api.download_illust_image(self.client, url, illust_id)
+                ext = os.path.splitext(url.split("?")[0])[1] or ".jpg"
+                blobs.append((idx, ext, blob))
+            first_ext = blobs[0][1] if blobs else ".jpg"
+            out_path = paths.illust_path(root, rec, first_ext)
+            old_path = existing.get("local_path") if existing else ""
+            if meta.page_count > 1:
+                os.makedirs(out_path, exist_ok=True)
+                prefix = f"{illust_id}_p"
+                for stale in os.listdir(out_path):
+                    if stale.startswith(prefix):
+                        try:
+                            os.remove(os.path.join(out_path, stale))
+                        except OSError:
+                            pass
+                for idx, ext, blob in blobs:
+                    fname = f"{illust_id}_p{idx}{ext}"
+                    with open(os.path.join(out_path, fname), "wb") as f:
+                        f.write(blob)
+            else:
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "wb") as f:
+                    f.write(blobs[0][2])
+            if old_path and os.path.abspath(old_path) != os.path.abspath(out_path) and os.path.exists(old_path):
+                if os.path.isdir(old_path):
+                    shutil.rmtree(old_path, ignore_errors=True)
+                else:
+                    os.remove(old_path)
+            self.db.upsert_illust({
+                "illust_id": illust_id,
+                "local_path": out_path,
+                "status": Status.OK,
+                "error_reason": "",
+                "last_fetch_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+            stat["illust_updated" if is_update else "illust_new"] += 1
+            self._emit("illust_done", illust_id=illust_id, title=meta.title, updated=is_update)
+            self.logger.info("图片 %s《%s》（%d 页）%s", illust_id, meta.title, meta.page_count,
+                             "更新完成" if is_update else "下载完成")
+        except AuthExpiredError:
+            raise
+        except Exception as e:
+            self.logger.error("图片 %s 处理失败：%s\n%s", illust_id, e, traceback.format_exc())
+            self._mark_illust_failed(illust_id, author_id, e)
+            stat["illust_failed"] += 1
+
+    def _index_illust(self, meta, existing, status: str) -> dict:
+        rec = {
+            "illust_id": meta.illust_id,
+            "author_id": meta.author_id,
+            "author_name": meta.author_name,
+            "title": meta.title,
+            "page_count": meta.page_count,
+            "tags": ",".join(meta.tags),
+            "x_restrict": meta.x_restrict,
+            "status": status,
+            "remote_updated_at": meta.upload_date,
+            "publish_date": meta.create_date,
+        }
+        if existing and existing.get("local_path"):
+            rec["local_path"] = existing["local_path"]
+        self.db.upsert_illust(rec)
+        merged = dict(existing or {})
+        merged.update(rec)
+        return merged
+
+    def _mark_illust_failed(self, illust_id: str, author_id: str, err: Exception, status: str = None):
+        if status is None:
+            status = Status.FAILED_AUTH if isinstance(err, AuthExpiredError) else (
+                Status.FAILED_403 if isinstance(err, RiskControlError) else (
+                    Status.FAILED_PARSE if isinstance(err, PixivRequestError) and err.kind == "parse"
+                    else Status.FAILED_NETWORK
+                )
+            )
+        existing = self.db.get_illust(illust_id)
+        if existing:
+            self.db.set_illust_status(illust_id, status, str(err)[:500])
+        else:
+            self.db.upsert_illust({
+                "illust_id": illust_id, "author_id": author_id,
+                "status": status, "error_reason": str(err)[:500],
+            })
 
     def _process_novel(self, novel_id: str, author_id: str, is_retry: bool = False, stat: dict = None):
         stat = stat if stat is not None else {"new": 0, "updated": 0, "skipped": 0, "failed": 0}
@@ -376,32 +649,48 @@ class ScraperEngine:
             })
 
     def _refresh_author_md(self, author_id: str, run_stat: dict = None):
-        author = next((a for a in self.db.list_authors() if a["author_id"] == author_id), None)
+        all_rows = [a for a in self.db.list_authors() if a["author_id"] == author_id]
+        author = next((a for a in all_rows if a.get("kind") == "novel"), None) or (all_rows[0] if all_rows else None)
         if not author:
             return
+        name = author.get("author_name") or ""
         novels = self.db.novels_by_author(author_id)
-        path = paths.author_md_path(self.settings, author_id, author.get("author_name") or "")
+        illusts = self.db.illusts_by_author(author_id)
+        in_novel_list = any(a.get("kind") == "novel" for a in all_rows)
+        in_illust_list = any(a.get("kind") == "illust" for a in all_rows)
+
+        path = paths.author_md_path(self.settings, author_id, name)
+        illust_path = paths.author_illust_md_path(self.settings, author_id, name)
+        write_novel = in_novel_list or novels or os.path.exists(path)
+        write_illust = in_illust_list or illusts or os.path.exists(illust_path)
         try:
-            write_author_md(path, author, novels, run_stat)
+            if write_novel:
+                write_author_md(path, author, novels, run_stat)
+            if write_illust:
+                write_illust_md(illust_path, author, illusts, run_stat)
         except Exception:
             self.logger.warning("作者 %s MD 索引写入失败", author_id, exc_info=True)
             return
-        cleanup_dirs = {os.path.dirname(path)}
-        if self.settings.md_separate and self.settings.md_root:
-            cleanup_dirs.add(self.settings.md_root)
+        cleanup_dirs = {os.path.dirname(path), os.path.dirname(illust_path)}
+        if self.settings.md_separate:
+            if self.settings.md_root:
+                cleanup_dirs.add(self.settings.md_root)
+            imr = paths.illust_md_root(self.settings)
+            if imr:
+                cleanup_dirs.add(imr)
         if os.path.isdir(self.settings.epub_root):
             for d in os.listdir(self.settings.epub_root):
                 full_dir = os.path.join(self.settings.epub_root, d)
                 if d.startswith(f"{author_id}_") and os.path.isdir(full_dir):
                     cleanup_dirs.add(full_dir)
-        new_abs = os.path.abspath(path)
+        keep = {os.path.abspath(path), os.path.abspath(illust_path)}
         for d in cleanup_dirs:
             if not os.path.isdir(d):
                 continue
             for fname in os.listdir(d):
                 full = os.path.join(d, fname)
                 if (fname.startswith(f"{author_id}_") and fname.endswith(".md")
-                        and os.path.abspath(full) != new_abs):
+                        and os.path.abspath(full) not in keep):
                     try:
                         os.remove(full)
                         self.logger.info("清理旧昵称 MD 文件：%s", fname)

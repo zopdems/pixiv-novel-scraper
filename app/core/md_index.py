@@ -40,6 +40,24 @@ def _entry_block(novel: dict, level: int) -> list:
     return lines
 
 
+def _illust_block(illust: dict) -> list:
+    url = f"https://www.pixiv.net/artworks/{illust['illust_id']}"
+    title = _plain(illust.get("title")) or illust["illust_id"]
+    status_note = ""
+    if illust.get("status") == Status.DELETED:
+        status_note = "（远端已删除）"
+    elif illust.get("status") == Status.SKIPPED:
+        status_note = "（已跳过）"
+    lines = [f"### [{title}]({url}){status_note}", "", f"- 链接：{url}"]
+    lines.append(f"- 页数：{int(illust.get('page_count') or 1)}")
+    if illust.get("publish_date"):
+        lines.append(f"- 发布时间：{_fmt_dt(illust['publish_date'])}")
+    tags = (illust.get("tags") or "").replace(",", ", ").strip(", ")
+    if tags:
+        lines.append(f"- 标签：{tags}")
+    return lines
+
+
 def render_author_md(author: dict, novels: list, run_stat: dict = None) -> str:
     singles = sorted(
         [n for n in novels if not n.get("series_id")],
@@ -61,13 +79,11 @@ def render_author_md(author: dict, novels: list, run_stat: dict = None) -> str:
         f"- 收录作品：{len(novels)} 部",
     ]
     if run_stat:
-        lines.append(
-            "- 最近抓取：{}（新增 {}，更新 {}，远端删除 {}，失败 {}）".format(
-                time.strftime("%Y-%m-%d %H:%M"),
-                run_stat.get("new", 0), run_stat.get("updated", 0),
-                run_stat.get("deleted", 0), run_stat.get("failed", 0),
-            )
+        summary = "新增 {} / 更新 {} / 远端删除 {} / 失败 {}".format(
+            run_stat.get("new", 0), run_stat.get("updated", 0),
+            run_stat.get("deleted", 0), run_stat.get("failed", 0),
         )
+        lines.append(f"- 最近抓取：{time.strftime('%Y-%m-%d %H:%M')}（{summary}）")
     lines += [
         "",
         "## 单篇",
@@ -93,9 +109,45 @@ def render_author_md(author: dict, novels: list, run_stat: dict = None) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_illust_md(author: dict, illusts: list, run_stat: dict = None) -> str:
+    name = author.get("author_name") or author["author_id"]
+    aid = author["author_id"]
+    lines = [
+        f"# {name}（插画·漫画）",
+        "",
+        f"- Pixiv：https://www.pixiv.net/users/{aid}",
+        f"- 收录插画/漫画：{len(illusts)} 幅",
+    ]
+    if run_stat:
+        summary = "新增 {} / 更新 {} / 远端删除 {} / 失败 {}".format(
+            run_stat.get("illust_new", 0), run_stat.get("illust_updated", 0),
+            run_stat.get("illust_deleted", 0), run_stat.get("illust_failed", 0),
+        )
+        lines.append(f"- 最近抓取：{time.strftime('%Y-%m-%d %H:%M')}（{summary}）")
+    lines += ["", "## 作品", ""]
+    if illusts:
+        ordered = sorted(illusts, key=lambda x: (x.get("publish_date") or "", x.get("illust_id") or ""))
+        for i in ordered:
+            lines += _illust_block(i)
+            lines.append("")
+    else:
+        lines.append("（暂无）")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def write_author_md(path: str, author: dict, novels: list, run_stat: dict = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     content = render_author_md(author, novels, run_stat)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def write_illust_md(path: str, author: dict, illusts: list, run_stat: dict = None) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    content = render_illust_md(author, illusts, run_stat)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)

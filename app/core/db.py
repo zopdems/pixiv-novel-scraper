@@ -5,7 +5,7 @@ import time
 
 from ..config import app_data_dir
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS authors (
@@ -40,6 +40,44 @@ CREATE INDEX IF NOT EXISTS idx_novels_series ON novels(series_id);
 CREATE INDEX IF NOT EXISTS idx_novels_status ON novels(status);
 """
 
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS illusts (
+    illust_id TEXT PRIMARY KEY,
+    author_id TEXT NOT NULL,
+    author_name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    page_count INTEGER NOT NULL DEFAULT 1,
+    tags TEXT NOT NULL DEFAULT '',
+    x_restrict INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    remote_updated_at TEXT NOT NULL DEFAULT '',
+    publish_date TEXT NOT NULL DEFAULT '',
+    local_path TEXT NOT NULL DEFAULT '',
+    last_fetch_at TEXT,
+    error_reason TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_illusts_author ON illusts(author_id);
+CREATE INDEX IF NOT EXISTS idx_illusts_status ON illusts(status);
+"""
+
+_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS authors_v3 (
+    author_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'novel',
+    author_name TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    pending_validate INTEGER NOT NULL DEFAULT 0,
+    last_fetch_at TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (author_id, kind)
+);
+INSERT OR IGNORE INTO authors_v3(author_id, author_name, enabled, pending_validate, last_fetch_at, created_at)
+    SELECT author_id, author_name, enabled, pending_validate, last_fetch_at, created_at FROM authors;
+DROP TABLE authors;
+ALTER TABLE authors_v3 RENAME TO authors;
+"""
+
 
 def db_path() -> str:
     return os.path.join(app_data_dir(), "index.db")
@@ -67,6 +105,10 @@ class Database:
                     self.logger.warning("索引备份失败：%s", backup, exc_info=True)
         if version < 1:
             self._conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            self._conn.executescript(_SCHEMA_V2)
+        if version < 3:
+            self._conn.executescript(_SCHEMA_V3)
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -78,23 +120,25 @@ class Database:
         return time.strftime("%Y-%m-%dT%H:%M:%S")
 
     # ---- authors ----
-    def add_author(self, author_id: str, author_name: str = "", pending_validate: bool = False) -> bool:
+    def add_author(self, author_id: str, author_name: str = "", pending_validate: bool = False, kind: str = "novel") -> bool:
         try:
             self._conn.execute(
-                "INSERT INTO authors(author_id, author_name, pending_validate, created_at) VALUES (?,?,?,?)",
-                (author_id, author_name, int(pending_validate), self._now()),
+                "INSERT INTO authors(author_id, kind, author_name, pending_validate, created_at) VALUES (?,?,?,?,?)",
+                (author_id, kind, author_name, int(pending_validate), self._now()),
             )
             self._conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
-    def remove_author(self, author_id: str):
-        self._conn.execute("DELETE FROM authors WHERE author_id=?", (author_id,))
+    def remove_author(self, author_id: str, kind: str = "novel"):
+        self._conn.execute("DELETE FROM authors WHERE author_id=? AND kind=?", (author_id, kind))
         self._conn.commit()
 
-    def set_author_enabled(self, author_id: str, enabled: bool):
-        self._conn.execute("UPDATE authors SET enabled=? WHERE author_id=?", (int(enabled), author_id))
+    def set_author_enabled(self, author_id: str, enabled: bool, kind: str = "novel"):
+        self._conn.execute(
+            "UPDATE authors SET enabled=? WHERE author_id=? AND kind=?", (int(enabled), author_id, kind)
+        )
         self._conn.commit()
 
     def update_author_name(self, author_id: str, name: str):
@@ -103,16 +147,30 @@ class Database:
         )
         self._conn.commit()
 
-    def touch_author_fetch(self, author_id: str):
-        self._conn.execute("UPDATE authors SET last_fetch_at=? WHERE author_id=?", (self._now(), author_id))
+    def touch_author_fetch(self, author_id: str, kind: str = "novel"):
+        self._conn.execute(
+            "UPDATE authors SET last_fetch_at=? WHERE author_id=? AND kind=?", (self._now(), author_id, kind)
+        )
         self._conn.commit()
 
-    def list_authors(self, enabled_only: bool = False) -> list:
+    def list_authors(self, enabled_only: bool = False, kind: str = None) -> list:
         sql = "SELECT * FROM authors"
+        conds, params = [], []
         if enabled_only:
-            sql += " WHERE enabled=1"
+            conds.append("enabled=1")
+        if kind:
+            conds.append("kind=?")
+            params.append(kind)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
         sql += " ORDER BY created_at"
-        return [dict(r) for r in self._conn.execute(sql).fetchall()]
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def get_author(self, author_id: str, kind: str = "novel"):
+        row = self._conn.execute(
+            "SELECT * FROM authors WHERE author_id=? AND kind=?", (author_id, kind)
+        ).fetchone()
+        return dict(row) if row else None
 
     def author_novel_count(self, author_id: str) -> int:
         row = self._conn.execute(
@@ -188,6 +246,76 @@ class Database:
             dict(r)
             for r in self._conn.execute(
                 "SELECT * FROM novels WHERE title LIKE ? OR author_name LIKE ? OR tags LIKE ? ORDER BY publish_date DESC",
+                (like, like, like),
+            ).fetchall()
+        ]
+
+    # ---- illusts ----
+    def get_illust(self, illust_id: str):
+        row = self._conn.execute("SELECT * FROM illusts WHERE illust_id=?", (illust_id,)).fetchone()
+        return dict(row) if row else None
+
+    def upsert_illust(self, rec: dict):
+        existing = self.get_illust(rec["illust_id"])
+        if existing is None:
+            rec.setdefault("first_seen_at", self._now())
+            cols = ", ".join(rec.keys())
+            marks = ", ".join("?" for _ in rec)
+            self._conn.execute(f"INSERT INTO illusts({cols}) VALUES ({marks})", tuple(rec.values()))
+        else:
+            rec.pop("illust_id", None)
+            rec.pop("first_seen_at", None)
+            if rec:
+                sets = ", ".join(f"{k}=?" for k in rec)
+                self._conn.execute(f"UPDATE illusts SET {sets} WHERE illust_id=?", tuple(rec.values()) + (existing["illust_id"],))
+        self._conn.commit()
+
+    def set_illust_status(self, illust_id: str, status: str, error_reason: str = ""):
+        self._conn.execute(
+            "UPDATE illusts SET status=?, error_reason=?, last_fetch_at=? WHERE illust_id=?",
+            (status, error_reason, self._now(), illust_id),
+        )
+        self._conn.commit()
+
+    def illusts_by_author(self, author_id: str) -> list:
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM illusts WHERE author_id=? ORDER BY publish_date, illust_id", (author_id,)
+            ).fetchall()
+        ]
+
+    def ok_illusts(self) -> list:
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM illusts WHERE status=? ORDER BY author_id, CAST(illust_id AS INTEGER)",
+                ("ok",),
+            ).fetchall()
+        ]
+
+    def failed_illusts(self) -> list:
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM illusts WHERE status IN ('failed_auth','failed_403','failed_network','failed_parse')"
+                " ORDER BY last_fetch_at"
+            ).fetchall()
+        ]
+
+    def author_illust_count(self, author_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM illusts WHERE author_id=? AND status='ok'",
+            (author_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def search_illusts(self, keyword: str) -> list:
+        like = f"%{keyword}%"
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM illusts WHERE title LIKE ? OR author_name LIKE ? OR tags LIKE ? ORDER BY publish_date DESC",
                 (like, like, like),
             ).fetchall()
         ]

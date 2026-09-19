@@ -8,23 +8,24 @@
 
 - **📚 EPUB 输出**：封面首页（无封面时自动用正文第一张插图）、作品信息页（作者 / 发布时间 / 标签 / 可点击的原作链接）、正文标记完整转换（`[chapter:]` 分页、`[[rb:]]` 注音、`[pixivimage:]` 插图、`[jump:]` 跳转链接）
 - **🔄 增量追更**：新作品水位线 + 系列构成轮询，远端内容更新自动重新打包，失败队列优先重试
-- **🗂 Markdown 索引**：每作者一份，含作者主页链接、收录统计、最近抓取摘要、单篇/系列分区，远端删除的作品自动标注
+- **🖼 插画/漫画追更**：独立的「插画作者」名单，加入即追更，与小说名单互不干扰（同一作者可同时入两个名单）；与小说共用同一套增量逻辑，单页作品存为 `标题.ID.png`，多页作品存为独立文件夹；同样支持更新检测、删除标记、R-18 与标签黑名单过滤
+- **🗂 Markdown 索引**：小说与插画各自独立成文（`作者ID_昵称.md` / `作者ID_昵称_插画.md`），含作者主页链接、收录统计、最近抓取摘要，远端删除的作品自动标注
 - **🔐 登录方式**：Cookie 粘贴导入，或内置浏览器登录自动获取；Cookie 经 Windows DPAPI 加密存储，日志自动脱敏
 - **🛡 稳健抓取**：Chrome TLS 指纹模拟（过 Cloudflare）、请求限速、指数退避、连续失败自动暂停、磁盘余量保险丝、任务可手动中止
-- **👤 作者管理**：批量导入、启停开关、离线待校验、作者改名自动迁移目录与索引、账号注销自动识别停用
+- **👤 作者管理**：小说 / 插画双名单独立维护，批量导入、启停开关、离线待校验、作者改名自动迁移目录与索引、账号注销自动识别停用
 - **🔍 本地检索**：按标题 / 作者 / 标签检索已收录作品，双击直达文件
 - **🎒 便携与迁移**：数据全在程序目录 `data\` 下；一键导出 / 导入备份 JSON（含作者、设置、Cookie），换电脑无损搬家
 - **⏰ 挂机友好**：系统托盘常驻、每日定时抓取、可选开机自启
 
 ## 界面预览
 
-主界面包含四个选项卡：作者（管理追踪列表）、任务（抓取进度与日志）、检索（本地书库搜索）、设置（路径 / 网络 / 抓取策略 / 备份迁移）。
+主界面包含四个选项卡：作者（小说作者 / 插画作者两个名单，分别管理追踪列表）、任务（抓取进度与日志）、检索（本地书库搜索）、设置（路径 / 网络 / 抓取策略 / 备份迁移）。
 
 ## 安装与使用
 
 ### 方式一：安装包（推荐给普通用户）
 
-1. 下载 `PixivNovelScraper-Setup-v1.0.0.exe`
+1. 下载 `PixivNovelScraper-Setup-v1.2.0.exe`
 2. 运行安装包，**可自选安装位置**（无需管理员权限）
 3. 首次启动按四步引导完成配置：选目录 → 导入 Cookie → 添加作者 → 风险确认
 4. 到「任务」页点「立即抓取」
@@ -42,9 +43,9 @@ python run.py
 
 ```bash
 # 单文件 exe（产物在 dist\）
-python -m PyInstaller --noconfirm --onefile --windowed --name PixivNovelScraper --collect-all ebooklib --collect-all curl_cffi --hidden-import win32crypt run.py
+python -m PyInstaller --noconfirm --onefile --windowed --name PixivNovelScraper --collect-all ebooklib --collect-all curl_cffi --collect-data certifi --hidden-import win32crypt run.py
 
-# 安装包（需先安装 NSIS）
+# 安装包（需 NSIS；项目上级目录 tools\nsis-3.10\ 下已放便携版可直接用）
 makensis.exe installer.nsi
 ```
 

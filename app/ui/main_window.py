@@ -74,6 +74,17 @@ class MainWindow(QMainWindow):
         self.refresh_failed()
 
     # ---------------- 作者 ----------------
+    def _make_author_table(self, count_label: str) -> QTableWidget:
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["昵称", "作者 ID", "状态", "最近抓取", count_label])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        return table
+
     def _build_authors_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -82,7 +93,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.author_input = QLineEdit()
-        self.author_input.setPlaceholderText("作者数字 ID")
+        self.author_input.setPlaceholderText("作者数字 ID（添加到当前选中的名单）")
         btn_add = QPushButton("添加")
         btn_add.setProperty("class", "primary")
         btn_add.clicked.connect(self.add_author)
@@ -93,15 +104,12 @@ class MainWindow(QMainWindow):
         row.addWidget(btn_batch)
         layout.addLayout(row)
 
-        self.author_table = QTableWidget(0, 5)
-        self.author_table.setHorizontalHeaderLabels(["昵称", "作者 ID", "状态", "最近抓取", "已收录作品"])
-        self.author_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.author_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.author_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.author_table.setAlternatingRowColors(True)
-        self.author_table.verticalHeader().setVisible(False)
-        self.author_table.setShowGrid(False)
-        layout.addWidget(self.author_table, 1)
+        self.author_tabs = QTabWidget()
+        self.novel_author_table = self._make_author_table("已收录小说")
+        self.illust_author_table = self._make_author_table("已收录插画")
+        self.author_tabs.addTab(self.novel_author_table, "小说作者")
+        self.author_tabs.addTab(self.illust_author_table, "插画作者")
+        layout.addWidget(self.author_tabs, 1)
 
         row2 = QHBoxLayout()
         btn_toggle = QPushButton("启用/停用")
@@ -115,64 +123,82 @@ class MainWindow(QMainWindow):
         layout.addLayout(row2)
         self.tabs.addTab(page, "作者")
 
+    def _active_author_kind(self) -> str:
+        return "novel" if self.author_tabs.currentIndex() == 0 else "illust"
+
+    def _active_author_table(self) -> QTableWidget:
+        return self.novel_author_table if self._active_author_kind() == "novel" else self.illust_author_table
+
     def add_author(self):
         text = self.author_input.text().strip()
         if not _AUTHOR_ID_RE.match(text):
             QMessageBox.warning(self, "输入无效", "作者 ID 应为纯数字")
             return
-        if self.db.add_author(text, pending_validate=True):
+        kind = self._active_author_kind()
+        if self.db.add_author(text, pending_validate=True, kind=kind):
             self.author_input.clear()
             self.refresh_authors()
         else:
-            QMessageBox.information(self, "已存在", "该作者已在列表中")
+            label = "小说" if kind == "novel" else "插画"
+            QMessageBox.information(self, "已存在", f"该作者已在{label}名单中")
 
     def batch_import(self):
         dlg = BatchImportDialog(self)
         if dlg.exec() != QDialog.Accepted:
             return
         ids = dlg.ids()
-        added = sum(1 for i in ids if self.db.add_author(i, pending_validate=True))
-        QMessageBox.information(self, "导入结果", f"共 {len(ids)} 个：成功 {added}，重复/无效 {len(ids) - added}")
+        kind = self._active_author_kind()
+        label = "小说" if kind == "novel" else "插画"
+        added = sum(1 for i in ids if self.db.add_author(i, pending_validate=True, kind=kind))
+        QMessageBox.information(self, "导入结果", f"导入到{label}名单：共 {len(ids)} 个，成功 {added}，重复/无效 {len(ids) - added}")
         self.refresh_authors()
 
     def _selected_author_id(self):
-        row = self.author_table.currentRow()
+        table = self._active_author_table()
+        row = table.currentRow()
         if row < 0:
             return None
-        return self.author_table.item(row, 1).text()
+        return table.item(row, 1).text()
 
     def toggle_author(self):
         aid = self._selected_author_id()
         if not aid:
             return
-        authors = {a["author_id"]: a for a in self.db.list_authors()}
-        cur = authors.get(aid)
+        kind = self._active_author_kind()
+        cur = self.db.get_author(aid, kind=kind)
         if cur:
-            self.db.set_author_enabled(aid, not cur["enabled"])
+            self.db.set_author_enabled(aid, not cur["enabled"], kind=kind)
             self.refresh_authors()
 
     def delete_author(self):
         aid = self._selected_author_id()
         if not aid:
             return
-        if QMessageBox.question(self, "确认", f"删除作者 {aid}？本地已下载文件不会被删除。") == QMessageBox.Yes:
-            self.db.remove_author(aid)
+        kind = self._active_author_kind()
+        label = "小说" if kind == "novel" else "插画"
+        if QMessageBox.question(self, "确认", f"从{label}名单删除作者 {aid}？本地已下载文件不会被删除。") == QMessageBox.Yes:
+            self.db.remove_author(aid, kind=kind)
             self.refresh_authors()
 
-    def refresh_authors(self):
-        authors = self.db.list_authors()
-        self.author_table.setRowCount(len(authors))
+    def _fill_author_table(self, table: QTableWidget, kind: str):
+        authors = self.db.list_authors(kind=kind)
+        table.setRowCount(len(authors))
         for i, a in enumerate(authors):
             name = a.get("author_name") or ("（待校验）" if a.get("pending_validate") else "（未知）")
+            count = self.db.author_novel_count(a["author_id"]) if kind == "novel" else self.db.author_illust_count(a["author_id"])
             items = [
                 name,
                 a["author_id"],
                 "启用" if a["enabled"] else "停用",
                 a.get("last_fetch_at") or "-",
-                str(self.db.author_novel_count(a["author_id"])),
+                str(count),
             ]
             for c, text in enumerate(items):
-                self.author_table.setItem(i, c, QTableWidgetItem(str(text)))
+                table.setItem(i, c, QTableWidgetItem(str(text)))
+
+    def refresh_authors(self):
+        self._fill_author_table(self.novel_author_table, "novel")
+        self._fill_author_table(self.illust_author_table, "illust")
 
     # ---------------- 任务 ----------------
     def _build_tasks_tab(self):
@@ -251,19 +277,34 @@ class MainWindow(QMainWindow):
         elif kind == "novel_done":
             tag = "重打包" if event.get("updated") else "新下载"
             self.progress_view.appendPlainText(f"  [{tag}] {event.get('title')}（{event.get('novel_id')}）")
+        elif kind == "illust_done":
+            tag = "图片更新" if event.get("updated") else "图片下载"
+            self.progress_view.appendPlainText(f"  [{tag}] {event.get('title')}（{event.get('illust_id')}）")
         elif kind == "author_done":
-            self.progress_view.appendPlainText(
+            line = (
                 f"  完成：新增 {event.get('new')} 更新 {event.get('updated')} 跳过 {event.get('skipped')} 失败 {event.get('failed')}"
             )
+            if event.get("illust_new") or event.get("illust_updated") or event.get("illust_failed") or event.get("illust_deleted"):
+                line += (
+                    f"；图片 新增 {event.get('illust_new')} 更新 {event.get('illust_updated')}"
+                    f" 删除 {event.get('illust_deleted')} 失败 {event.get('illust_failed')}"
+                )
+            self.progress_view.appendPlainText(line)
 
     def on_finished(self, report):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.run_status.setText("就绪")
         summary = (
-            f"=== 任务结束：新增 {report.new_count}，更新 {report.updated_count}，"
-            f"跳过 {report.skipped_count}，失败 {report.failed_count}，远端删除 {report.deleted_count} ==="
+            f"=== 任务结束：小说 新增 {report.new_count}，更新 {report.updated_count}，"
+            f"跳过 {report.skipped_count}，失败 {report.failed_count}，远端删除 {report.deleted_count}"
         )
+        if report.illust_new or report.illust_updated or report.illust_failed or report.illust_deleted:
+            summary += (
+                f"；图片 新增 {report.illust_new}，更新 {report.illust_updated}，"
+                f"失败 {report.illust_failed}，远端删除 {report.illust_deleted}"
+            )
+        summary += " ==="
         if report.aborted_reason:
             summary += f"\n{report.aborted_reason}"
         self.progress_view.appendPlainText(summary)
@@ -274,12 +315,17 @@ class MainWindow(QMainWindow):
 
     def refresh_failed(self):
         failed = self.db.failed_novels()
-        self.failed_table.setRowCount(len(failed))
-        for i, n in enumerate(failed):
-            for c, text in enumerate([
-                n["novel_id"], n.get("title") or "-", n.get("error_reason") or "-",
-                status_label(n["status"]),
-            ]):
+        rows = [
+            (n["novel_id"], n.get("title") or "-", n.get("error_reason") or "-", status_label(n["status"]))
+            for n in failed
+        ]
+        rows += [
+            (i["illust_id"], "[图] " + (i.get("title") or "-"), i.get("error_reason") or "-", status_label(i["status"]))
+            for i in self.db.failed_illusts()
+        ]
+        self.failed_table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            for c, text in enumerate(row):
                 self.failed_table.setItem(i, c, QTableWidgetItem(str(text)))
 
     # ---------------- 检索 ----------------
@@ -355,7 +401,21 @@ class MainWindow(QMainWindow):
         btn_md = QPushButton("浏览…")
         btn_md.clicked.connect(lambda: self._pick_dir(self.set_md))
         r = QHBoxLayout(); r.addWidget(self.set_md, 1); r.addWidget(btn_md)
-        form.addRow("MD 索引目录", r)
+        form.addRow("小说 MD 目录", r)
+
+        self.set_illust_md = QLineEdit(getattr(s, "illust_md_root", "") or "")
+        self.set_illust_md.setPlaceholderText("留空 = 与小说 MD 同目录")
+        btn_imd = QPushButton("浏览…")
+        btn_imd.clicked.connect(lambda: self._pick_dir(self.set_illust_md))
+        r = QHBoxLayout(); r.addWidget(self.set_illust_md, 1); r.addWidget(btn_imd)
+        form.addRow("插画 MD 目录", r)
+
+        self.set_illust_root = QLineEdit(getattr(s, "illust_root", "") or "")
+        self.set_illust_root.setPlaceholderText("留空 = EPUB 目录下的「图片」文件夹")
+        btn_illust = QPushButton("浏览…")
+        btn_illust.clicked.connect(lambda: self._pick_dir(self.set_illust_root))
+        r = QHBoxLayout(); r.addWidget(self.set_illust_root, 1); r.addWidget(btn_illust)
+        form.addRow("图片保存目录", r)
 
         self.set_time = QTimeEdit(QTime.fromString(s.fetch_time, "HH:mm"))
         self.set_time.setDisplayFormat("HH:mm")
@@ -521,6 +581,8 @@ class MainWindow(QMainWindow):
         s = self.settings
         s.epub_root = self.set_epub.text().strip()
         s.md_root = self.set_md.text().strip()
+        s.illust_md_root = self.set_illust_md.text().strip()
+        s.illust_root = self.set_illust_root.text().strip()
         s.fetch_time = self.set_time.time().toString("HH:mm")
         s.request_interval = float(self.set_interval.value())
         s.max_consecutive_failures = int(self.set_maxfail.value())

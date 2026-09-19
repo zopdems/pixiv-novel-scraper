@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import Settings, load_settings, save_settings
 from app.core.db import Database
 from app.core.epub_exporter import build_epub
-from app.core.md_index import render_author_md
+from app.core.md_index import render_author_md, render_illust_md
 from app.core.models import Status
 from app.core import paths
 from app.pixiv.markup import convert_novel_markup
@@ -70,9 +70,16 @@ check("同名自身不冲突", paths.resolve_collision(_exist, {"novel_id": "7"}
 # 3. 数据库
 tmp = tempfile.mkdtemp()
 db = Database(path=os.path.join(tmp, "t.db"))
-check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 1)
+check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 3)
 check("新增作者", db.add_author("100", "作者甲") is True)
 check("重复作者拒绝", db.add_author("100") is False)
+check("同 ID 可入插画名单", db.add_author("100", kind="illust") is True)
+check("插画名单重复拒绝", db.add_author("100", kind="illust") is False)
+check("名单按类型隔离", len(db.list_authors(kind="novel")) == 1 and len(db.list_authors(kind="illust")) == 1)
+db.set_author_enabled("100", False, kind="illust")
+check("分名单启停", db.get_author("100", "illust")["enabled"] == 0 and db.get_author("100", "novel")["enabled"] == 1)
+db.remove_author("100", kind="illust")
+check("分名单删除", db.get_author("100", "illust") is None and db.get_author("100", "novel") is not None)
 db.upsert_novel({
     "novel_id": "5001", "author_id": "100", "author_name": "作者甲", "title": "旧标题",
     "status": Status.OK, "remote_updated_at": "2026-01-01T00:00:00", "local_path": r"C:\x\旧标题.5001.epub",
@@ -86,7 +93,57 @@ db.set_novel_status("5001", Status.OK)
 check("ok_novels 查询", [n["novel_id"] for n in db.ok_novels()] == ["5001"])
 check("检索命中", len(db.search_novels("新标题")) == 1)
 check("作者作品数", db.author_novel_count("100") == 1)
+
+# 3b. 插画库
+db.upsert_illust({
+    "illust_id": "9001", "author_id": "100", "author_name": "作者甲", "title": "插图A",
+    "page_count": 3, "status": Status.OK, "remote_updated_at": "2026-01-01T00:00:00",
+    "publish_date": "2026-01-01T00:00:00+09:00", "local_path": r"C:\x\插图A.9001",
+})
+rec_i = db.get_illust("9001")
+check("插画入库", rec_i is not None and rec_i["page_count"] == 3)
+db.upsert_illust({"illust_id": "9001", "title": "插图A改"})
+rec_i = db.get_illust("9001")
+check("插画局部更新", rec_i["title"] == "插图A改" and rec_i["local_path"].endswith("9001"))
+db.set_illust_status("9001", Status.FAILED_NETWORK, "超时")
+check("插画失败队列", len(db.failed_illusts()) == 1)
+db.set_illust_status("9001", Status.OK)
+check("ok_illusts 查询", [i["illust_id"] for i in db.ok_illusts()] == ["9001"])
+check("作者插画数", db.author_illust_count("100") == 1)
+check("插画检索", len(db.search_illusts("插图A")) == 1)
 db.close()
+
+# 3c. 插画路径规则
+from app.core import paths as _paths
+_i1 = {"illust_id": "9001", "author_id": "100", "author_name": "作者甲", "title": "单页图", "page_count": 1}
+_i2 = {"illust_id": "9002", "author_id": "100", "author_name": "作者甲", "title": "多页图", "page_count": 5}
+check("单页图路径为文件", _paths.illust_path(r"C:\img", _i1, ".png") == os.path.join(r"C:\img", "100_作者甲", "单页图.9001.png"))
+check("多页图路径为文件夹", _paths.illust_path(r"C:\img", _i2) == os.path.join(r"C:\img", "100_作者甲", "多页图.9002"))
+_s = Settings(epub_root=r"C:\epub")
+check("图片目录默认跟随 EPUB", _paths.illust_root(_s) == os.path.join(r"C:\epub", "图片"))
+_s.illust_root = r"D:\pic"
+check("图片目录自定义", _paths.illust_root(_s) == r"D:\pic")
+_s2 = Settings(epub_root=r"C:\epub", md_root=r"C:\md")
+check("插画 MD 默认跟随小说 MD", _paths.author_illust_md_path(_s2, "100", "作者甲") == os.path.join(r"C:\md", "100_作者甲_插画.md"))
+_s2.illust_md_root = r"D:\imd"
+check("插画 MD 独立目录", _paths.author_illust_md_path(_s2, "100", "作者甲") == os.path.join(r"D:\imd", "100_作者甲_插画.md"))
+check("小说 MD 不受影响", _paths.author_md_path(_s2, "100", "作者甲") == os.path.join(r"C:\md", "100_作者甲.md"))
+
+# 3d. 插画 MD 独立索引
+md3 = render_illust_md(
+    {"author_id": "100", "author_name": "作者甲"},
+    [{"illust_id": "9001", "title": "插图A", "status": "ok", "page_count": 3,
+      "publish_date": "2026-01-01T00:00:00+09:00", "tags": "原创,风景"}],
+    {"illust_new": 2, "illust_updated": 0, "illust_deleted": 0, "illust_failed": 0},
+)
+check("插画 MD 标题", md3.startswith("# 作者甲（插画·漫画）\n"))
+check("插画 MD 分区", "## 作品" in md3)
+check("插画 MD 链接", "### [插图A](https://www.pixiv.net/artworks/9001)" in md3)
+check("插画 MD 页数", "- 页数：3" in md3)
+check("插画 MD 收录统计", "- 收录插画/漫画：1 幅" in md3)
+check("插画 MD 抓取统计", "新增 2 / 更新 0 / 远端删除 0 / 失败 0" in md3)
+md3n = render_author_md({"author_id": "100", "author_name": "作者甲"}, [])
+check("小说 MD 不含插画分区", "插画" not in md3n)
 
 # 4. EPUB 构建
 meta = NovelMeta(
@@ -132,7 +189,7 @@ md2 = render_author_md(
       "publish_date": "", "remote_updated_at": "", "description": ""}],
     {"new": 9, "updated": 1, "deleted": 2, "failed": 0},
 )
-check("MD 最近抓取统计", "- 最近抓取：" in md2 and "新增 9，更新 1，远端删除 2，失败 0" in md2)
+check("MD 最近抓取统计", "- 最近抓取：" in md2 and "新增 9 / 更新 1 / 远端删除 2 / 失败 0" in md2)
 check("MD 单篇标题行", "### [单篇A](https://www.pixiv.net/novel/show.php?id=1)" in md)
 check("MD 链接行", "- 链接：https://www.pixiv.net/novel/show.php?id=1" in md)
 check("MD 发布时间", "- 发布时间：2026-01-01 12:30" in md)

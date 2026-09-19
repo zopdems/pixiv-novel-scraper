@@ -63,6 +63,8 @@ class Settings:
     autostart: bool = False
     risk_accepted: bool = False
     onboarded: bool = False
+    illust_root: str = ""
+    illust_md_root: str = ""
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
 
     @property
