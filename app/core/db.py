@@ -2,10 +2,13 @@ import os
 import shutil
 import sqlite3
 import time
+from datetime import datetime
 
 from ..config import app_data_dir
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+SERIES_RECHECK_DAYS = 30
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS authors (
@@ -78,6 +81,14 @@ DROP TABLE authors;
 ALTER TABLE authors_v3 RENAME TO authors;
 """
 
+_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS deleted_series (
+    series_id TEXT PRIMARY KEY,
+    author_id TEXT NOT NULL,
+    marked_at TEXT NOT NULL
+);
+"""
+
 
 def db_path() -> str:
     return os.path.join(app_data_dir(), "index.db")
@@ -109,6 +120,8 @@ class Database:
             self._conn.executescript(_SCHEMA_V2)
         if version < 3:
             self._conn.executescript(_SCHEMA_V3)
+        if version < 4:
+            self._conn.executescript(_SCHEMA_V4)
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -179,6 +192,13 @@ class Database:
         ).fetchone()
         return int(row[0])
 
+    def author_deleted_novel_count(self, author_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM novels WHERE author_id=? AND status='deleted'",
+            (author_id,),
+        ).fetchone()
+        return int(row[0])
+
     # ---- novels ----
     def get_novel(self, novel_id: str):
         row = self._conn.execute("SELECT * FROM novels WHERE novel_id=?", (novel_id,)).fetchone()
@@ -232,6 +252,14 @@ class Database:
             ).fetchall()
         ]
 
+    def deleted_novels(self) -> list:
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM novels WHERE status='deleted' ORDER BY last_fetch_at DESC"
+            ).fetchall()
+        ]
+
     def series_ids_by_author(self, author_id: str) -> list:
         return [
             r[0]
@@ -239,6 +267,37 @@ class Database:
                 "SELECT DISTINCT series_id FROM novels WHERE author_id=? AND series_id != ''", (author_id,)
             ).fetchall()
         ]
+
+    def mark_series_deleted(self, series_id: str, author_id: str):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO deleted_series(series_id, author_id, marked_at) VALUES (?,?,?)",
+            (series_id, author_id, self._now()),
+        )
+        self._conn.commit()
+
+    def unmark_series_deleted(self, series_id: str):
+        self._conn.execute("DELETE FROM deleted_series WHERE series_id=?", (series_id,))
+        self._conn.commit()
+
+    def deleted_series_ids(self, author_id: str) -> set:
+        return {
+            r[0]
+            for r in self._conn.execute(
+                "SELECT series_id FROM deleted_series WHERE author_id=?", (author_id,)
+            ).fetchall()
+        }
+
+    def should_poll_series(self, series_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT marked_at FROM deleted_series WHERE series_id=?", (series_id,)
+        ).fetchone()
+        if not row:
+            return True
+        try:
+            marked = datetime.fromisoformat(row[0])
+        except ValueError:
+            return True
+        return (datetime.now() - marked).days >= SERIES_RECHECK_DAYS
 
     def search_novels(self, keyword: str) -> list:
         like = f"%{keyword}%"
@@ -303,9 +362,31 @@ class Database:
             ).fetchall()
         ]
 
+    def deleted_illusts(self) -> list:
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM illusts WHERE status='deleted' ORDER BY last_fetch_at DESC"
+            ).fetchall()
+        ]
+
     def author_illust_count(self, author_id: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) FROM illusts WHERE author_id=? AND status='ok'",
+            (author_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def author_deleted_illust_count(self, author_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM illusts WHERE author_id=? AND status='deleted'",
+            (author_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def deleted_series_count(self, author_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM deleted_series WHERE author_id=?",
             (author_id,),
         ).fetchone()
         return int(row[0])

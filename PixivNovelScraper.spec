@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['win32crypt']
+hiddenimports = ['win32crypt', 'PySide6.QtSvg', 'PySide6.QtSvgWidgets']
 datas += collect_data_files('certifi')
 tmp_ret = collect_all('ebooklib')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -37,7 +37,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # 不要 UPX 加壳：加壳会显著提高杀毒软件的启发式误报率
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

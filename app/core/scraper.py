@@ -10,7 +10,7 @@ from ..pixiv import api
 from ..pixiv.client import AuthExpiredError, PixivClient, PixivRequestError, RiskControlError
 from ..pixiv.markup import convert_novel_markup
 from . import paths
-from .db import Database
+from .db import SERIES_RECHECK_DAYS, Database
 from .epub_exporter import build_epub
 from .md_index import write_author_md, write_illust_md
 from .models import Status
@@ -130,6 +130,7 @@ class ScraperEngine:
     def _process_author(self, author: dict):
         aid = author["author_id"]
         stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0, "deleted": 0,
+                "series_deleted": 0,
                 "illust_new": 0, "illust_updated": 0, "illust_skipped": 0,
                 "illust_failed": 0, "illust_deleted": 0}
         self.report.per_author[aid] = stat
@@ -191,11 +192,22 @@ class ScraperEngine:
 
         for series_id in self.db.series_ids_by_author(aid):
             self._guard_failures()
+            if not self.db.should_poll_series(series_id):
+                continue
             try:
                 series = api.get_series_novel_ids(self.client, series_id)
+            except PixivRequestError as e:
+                if e.kind == "not_found":
+                    self.db.mark_series_deleted(series_id, aid)
+                    stat["series_deleted"] += 1
+                    self.logger.info("系列 %s 已不存在（404），标记为已删除，%d 天后重试", series_id, SERIES_RECHECK_DAYS)
+                else:
+                    self.logger.warning("系列 %s 轮询失败：%s", series_id, e)
+                continue
             except Exception as e:
                 self.logger.warning("系列 %s 轮询失败：%s", series_id, e)
                 continue
+            self.db.unmark_series_deleted(series_id)
             for nid in series.novel_ids:
                 rec = self.db.get_novel(nid)
                 if rec is None or rec["status"] == Status.OUTDATED:
@@ -663,9 +675,10 @@ class ScraperEngine:
         illust_path = paths.author_illust_md_path(self.settings, author_id, name)
         write_novel = in_novel_list or novels or os.path.exists(path)
         write_illust = in_illust_list or illusts or os.path.exists(illust_path)
+        deleted_series = self.db.deleted_series_ids(author_id) if write_novel else set()
         try:
             if write_novel:
-                write_author_md(path, author, novels, run_stat)
+                write_author_md(path, author, novels, run_stat, deleted_series)
             if write_illust:
                 write_illust_md(illust_path, author, illusts, run_stat)
         except Exception:

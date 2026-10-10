@@ -3,3 +3,27 @@ build/
 dist/
 *.exe
 *.pkg
+*.spec.bak
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 运行时数据（含 Cookie 凭据 / 索引库 / 日志，切勿提交）
+data/
+*.db
+*.db.bak
+credential.bin
+*.log
+logs/
+
+# 本机生成的图标缓存
+ui_assets/
+
+# 依赖与编辑器
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+package-lock.json

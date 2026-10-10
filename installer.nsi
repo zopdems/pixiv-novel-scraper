@@ -1,7 +1,7 @@
 ﻿!include "MUI2.nsh"
 
 Name "Pixiv 小说自动抓取器"
-OutFile "dist\PixivNovelScraper-Setup-v1.2.0.exe"
+OutFile "dist\PixivNovelScraper-Setup-v1.3.0.exe"
 Unicode true
 RequestExecutionLevel user
 InstallDir "$LOCALAPPDATA\Programs\PixivNovelScraper"
@@ -25,7 +25,7 @@ Section "主程序（必需）" SecMain
     WriteUninstaller "$INSTDIR\Uninstall.exe"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayName" "Pixiv 小说自动抓取器"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayVersion" "1.2.0"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayVersion" "1.3.0"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "Publisher" "Tix"
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "NoModify" 1
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "NoRepair" 1

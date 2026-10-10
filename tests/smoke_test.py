@@ -70,7 +70,7 @@ check("同名自身不冲突", paths.resolve_collision(_exist, {"novel_id": "7"}
 # 3. 数据库
 tmp = tempfile.mkdtemp()
 db = Database(path=os.path.join(tmp, "t.db"))
-check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 3)
+check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 4)
 check("新增作者", db.add_author("100", "作者甲") is True)
 check("重复作者拒绝", db.add_author("100") is False)
 check("同 ID 可入插画名单", db.add_author("100", kind="illust") is True)
@@ -111,6 +111,14 @@ db.set_illust_status("9001", Status.OK)
 check("ok_illusts 查询", [i["illust_id"] for i in db.ok_illusts()] == ["9001"])
 check("作者插画数", db.author_illust_count("100") == 1)
 check("插画检索", len(db.search_illusts("插图A")) == 1)
+
+db.upsert_novel({"novel_id": "6001", "author_id": "100", "author_name": "作者甲", "title": "系列A", "series_id": "13941263", "status": Status.OK})
+check("系列轮询默认允许", db.should_poll_series("13941263") is True)
+db.mark_series_deleted("13941263", "100")
+check("系列 404 后标记跳过", db.should_poll_series("13941263") is False)
+db.unmark_series_deleted("13941263")
+check("系列恢复后允许轮询", db.should_poll_series("13941263") is True)
+
 db.close()
 
 # 3c. 插画路径规则
@@ -187,9 +195,9 @@ md2 = render_author_md(
     {"author_id": "100", "author_name": "作者甲"},
     [{"novel_id": "1", "title": "单篇A", "series_id": "", "tags": "", "status": "ok",
       "publish_date": "", "remote_updated_at": "", "description": ""}],
-    {"new": 9, "updated": 1, "deleted": 2, "failed": 0},
+    {"new": 9, "updated": 1, "deleted": 2, "failed": 0, "series_deleted": 0},
 )
-check("MD 最近抓取统计", "- 最近抓取：" in md2 and "新增 9 / 更新 1 / 远端删除 2 / 失败 0" in md2)
+check("MD 最近抓取统计", "- 最近抓取：" in md2 and "新增 9 / 更新 1 / 远端删除 2（单篇 2 / 系列 0）/ 失败 0" in md2)
 check("MD 单篇标题行", "### [单篇A](https://www.pixiv.net/novel/show.php?id=1)" in md)
 check("MD 链接行", "- 链接：https://www.pixiv.net/novel/show.php?id=1" in md)
 check("MD 发布时间", "- 发布时间：2026-01-01 12:30" in md)
@@ -198,6 +206,16 @@ check("MD 标签逗号分隔", "- 标签：原创, 奇幻" in md)
 check("MD 简介引用块", "> 第一段简介\n>\n> 第二段简介\n> 尾部" in md)
 check("MD 系列分区", "### 系列S" in md)
 check("MD 系列条目四级标题", "#### [系列一章](https://www.pixiv.net/novel/show.php?id=2)（远端已删除）" in md)
+md_del = render_author_md(
+    {"author_id": "100", "author_name": "作者甲"},
+    [{"novel_id": "2", "title": "系列一章", "series_id": "s1", "series_title": "系列S",
+      "series_order": 1, "tags": "", "status": "ok", "publish_date": "", "remote_updated_at": "", "description": ""}],
+    deleted_series={"s1"},
+)
+check("MD 系列删除标注", "### 系列S（系列已删除）" in md_del)
+check("MD 开头已删除系列统计", "- 已删除系列：1 个" in md_del)
+check("MD 未删系列无标注", "### 系列S\n" in md)
+check("MD 未删系列无开头统计", "- 已删除系列" not in md)
 
 # 5b. 命名迁移
 _mig_dir = tempfile.mkdtemp()

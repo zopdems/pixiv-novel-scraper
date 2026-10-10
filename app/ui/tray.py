@@ -1,46 +1,55 @@
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-
-def make_icon() -> QIcon:
-    pm = QPixmap(64, 64)
-    pm.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(pm)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setBrush(QColor("#12B886"))
-    painter.setPen(QColor("#075E45"))
-    painter.drawEllipse(4, 4, 56, 56)
-    painter.setPen(QColor("white"))
-    painter.drawText(pm.rect(), 0x84, "P")
-    painter.end()
-    return QIcon(pm)
+from .icons import app_icon, icon
+from .theme import current_mode, tokens
 
 
 class TrayIcon(QSystemTrayIcon):
     def __init__(self, window, on_fetch, on_quit, parent=None):
-        super().__init__(make_icon(), parent)
+        super().__init__(app_icon(64), parent)
         self.window = window
+
         menu = QMenu()
+        menu.setObjectName("trayMenu")
         act_fetch = menu.addAction("立即抓取")
+        act_fetch.setIcon(icon("play", tokens()["accent_text"], 15))
         act_fetch.triggered.connect(on_fetch)
-        act_open = menu.addAction("打开设置")
+        act_open = menu.addAction("打开主窗口")
+        act_open.setIcon(icon("external", tokens()["accent_text"], 15))
         act_open.triggered.connect(self._show_window)
         menu.addSeparator()
         act_quit = menu.addAction("退出")
+        act_quit.setIcon(icon("power", tokens()["danger"], 15))
         act_quit.triggered.connect(on_quit)
         self.setContextMenu(menu)
+
         self.activated.connect(self._on_activated)
-        self.setToolTip("Pixiv 小说自动抓取器")
+        self.setToolTip("Pixiv 小说抓取器")
 
     def _show_window(self):
         self.window.showNormal()
         self.window.activateWindow()
-        self.window.select_settings_tab()
+        self.window.raise_()
 
     def _on_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
             self.window.showNormal()
             self.window.activateWindow()
+            self.window.raise_()
+
+    def refresh_icons(self):
+        """主题切换后重建菜单图标颜色。"""
+        menu = self.contextMenu()
+        if not menu:
+            return
+        t = tokens(current_mode())
+        for action in menu.actions():
+            if action.isSeparator():
+                continue
+            name = {"立即抓取": "play", "打开主窗口": "external", "退出": "power"}.get(action.text())
+            if name:
+                color = t["danger"] if name == "power" else t["accent_text"]
+                action.setIcon(icon(name, color, 15))
 
     def notify(self, title: str, message: str):
         self.showMessage(title, message, QSystemTrayIcon.Information, 8000)

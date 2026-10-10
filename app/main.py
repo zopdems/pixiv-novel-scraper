@@ -3,13 +3,16 @@ import sys
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
+from .autostart import set_autostart
 from .config import load_settings, save_settings
 from .core.db import Database
 from .credentials import load_cookie
 from .logging_setup import setup_logging
 from .scheduler import DailyScheduler
+from .ui.icons import app_icon
 from .ui.main_window import MainWindow
 from .ui.onboarding import OnboardingWizard
+from .ui.theme import apply_theme
 from .ui.tray import TrayIcon
 
 
@@ -35,11 +38,15 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    from .ui.style import QSS
-    app.setStyleSheet(QSS)
+    app.setWindowIcon(app_icon(64))
+
     logger = setup_logging()
     settings = load_settings()
+    apply_theme(app, getattr(settings, "theme", "light"))
     db = Database(logger=logger)
+
+    if settings.autostart and getattr(sys, "frozen", False):
+        set_autostart(True)
 
     if not settings.onboarded:
         wizard = OnboardingWizard(settings, db)
@@ -66,6 +73,7 @@ def main():
 
     tray = TrayIcon(window, on_fetch=window.start_fetch, on_quit=window.force_quit)
     tray.show()
+    window.on_theme_changed = tray.refresh_icons
 
     def tick():
         scheduler.set_time(settings.fetch_time)
@@ -89,7 +97,10 @@ def main():
     timer.timeout.connect(tick)
     timer.start(30 * 1000)
 
-    window.show()
+    if "--silent" in sys.argv:
+        logger.info("静默启动：不显示主窗口，常驻系统托盘")
+    else:
+        window.show()
     sys.exit(app.exec())
 
 

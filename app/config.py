@@ -66,6 +66,7 @@ class Settings:
     illust_root: str = ""
     illust_md_root: str = ""
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
+    theme: str = "light"  # light / dark / auto
 
     @property
     def md_separate(self) -> bool:

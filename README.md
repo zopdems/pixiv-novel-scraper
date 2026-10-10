@@ -15,17 +15,24 @@
 - **👤 作者管理**：小说 / 插画双名单独立维护，批量导入、启停开关、离线待校验、作者改名自动迁移目录与索引、账号注销自动识别停用
 - **🔍 本地检索**：按标题 / 作者 / 标签检索已收录作品，双击直达文件
 - **🎒 便携与迁移**：数据全在程序目录 `data\` 下；一键导出 / 导入备份 JSON（含作者、设置、Cookie），换电脑无损搬家
-- **⏰ 挂机友好**：系统托盘常驻、每日定时抓取、可选开机自启
+- **⏰ 挂机友好**：系统托盘常驻、每日定时抓取、可选开机自启（静默启动，不弹主窗口，直接驻留托盘）
 
 ## 界面预览
 
-主界面包含四个选项卡：作者（小说作者 / 插画作者两个名单，分别管理追踪列表）、任务（抓取进度与日志）、检索（本地书库搜索）、设置（路径 / 网络 / 抓取策略 / 备份迁移）。
+主界面采用「顶栏 + 左侧导航 + 卡片式内容区」布局，包含四个页面：
+
+- **作者**：小说作者 / 插画作者双名单，支持批量导入、启停开关，双击昵称直达 Pixiv 主页
+- **任务**：手动触发同步，深色终端样式的实时日志，失败 / 远端已删除队列
+- **检索**：按标题 / 作者 / 标签搜索本地书库，双击打开所在目录
+- **设置**：外观主题、存储路径、抓取策略、网络、登录 Cookie、备份迁移
+
+支持**浅色 / 深色双主题**，可在「设置 → 外观」切换，或点击右上角月亮 / 太阳图标快速切换，选择会随配置保存。
 
 ## 安装与使用
 
 ### 方式一：安装包（推荐给普通用户）
 
-1. 下载 `PixivNovelScraper-Setup-v1.2.0.exe`
+1. 下载 `PixivNovelScraper-Setup-v1.3.0.exe`
 2. 运行安装包，**可自选安装位置**（无需管理员权限）
 3. 首次启动按四步引导完成配置：选目录 → 导入 Cookie → 添加作者 → 风险确认
 4. 到「任务」页点「立即抓取」
@@ -42,12 +49,17 @@ python run.py
 ### 自行打包
 
 ```bash
-# 单文件 exe（产物在 dist\）
-python -m PyInstaller --noconfirm --onefile --windowed --name PixivNovelScraper --collect-all ebooklib --collect-all curl_cffi --collect-data certifi --hidden-import win32crypt run.py
+# 方式 A：单文件 exe（产物 dist\PixivNovelScraper.exe，约 50 MB）
+python -m PyInstaller --noconfirm PixivNovelScraper.spec
+
+# 方式 B：目录版（产物 dist\PixivNovelScraper-OneDir\，杀软误报率通常更低）
+python -m PyInstaller --noconfirm PixivNovelScraper-onedir.spec
 
 # 安装包（需 NSIS；项目上级目录 tools\nsis-3.10\ 下已放便携版可直接用）
 makensis.exe installer.nsi
 ```
+
+> 安装前请先修改 `installer.nsi` 里的版本号，与本次发布保持一致。
 
 ## 获取 Cookie 的两种方式
 
@@ -62,22 +74,40 @@ makensis.exe installer.nsi
 | 提示 Cloudflare 风控拦截 | 请求过密的临时限制，调大请求间隔（建议 3 秒），稍后重试，失败作品会自动重试 |
 | Cookie 无效 / 401 | Cookie 复制不完整或已过期，重新登录获取 |
 | 改过的设置运行中生效吗 | 请求间隔、命名规则、黑名单等立即生效；Cookie / 代理 / UA 需下轮任务生效 |
-| exe 被杀软报毒 | PyInstaller 打包的已知误报，加白名单或改用源码运行 |
+| exe 被杀软报毒 | PyInstaller 打包的已知误报（无签名 + 自解压 stub + curl_cffi），可改用**目录版**打包、向厂商提交误报、或加白名单 / 改用源码运行 |
 
 ## 目录结构
 
 ```
 pixiv-novel-scraper/
-├── run.py                 # 程序入口
-├── requirements.txt       # 依赖清单
-├── installer.nsi          # NSIS 安装包脚本
+├── run.py                       # 程序入口
+├── requirements.txt             # 依赖清单
+├── installer.nsi                # NSIS 安装包脚本
+├── PixivNovelScraper.spec       # 打包配置：单文件版
+├── PixivNovelScraper-onedir.spec# 打包配置：目录版（误报率更低）
 ├── app/
-│   ├── ui/                # 界面（主窗口 / 托盘 / 引导 / 登录）
-│   ├── core/              # 抓取引擎、索引库、EPUB 打包、配置管理
-│   └── pixiv/             # Pixiv API 客户端、正文标记转换
-├── tests/smoke_test.py    # 冒烟自检（约 50 项）
-└── dist/                  # 打包产物
+│   ├── ui/
+│   │   ├── main_window.py       # 主窗口（顶栏 / 侧边导航 / 四个页面）
+│   │   ├── theme.py             # 设计令牌 + QPalette + QSS 生成（浅/深主题）
+│   │   ├── icons.py             # 内置 SVG 矢量图标
+│   │   ├── onboarding.py        # 首次使用引导
+│   │   └── tray.py              # 系统托盘
+│   ├── core/                    # 抓取引擎、索引库、EPUB 打包、配置管理
+│   └── pixiv/                   # Pixiv API 客户端、正文标记转换
+├── tests/smoke_test.py          # 冒烟自检（约 50 项）
+└── dist/                        # 打包产物（不入库）
 ```
+
+## 更新日志
+
+### v1.3.0
+
+- **界面重做**：顶栏 + 左侧图标导航 + 卡片式布局，替代原来的四选项卡
+- **新增深色主题**：浅色 / 深色 / 跟随系统，可实时切换并保存
+- **全新图标系统**：内置矢量图标，导航、按钮、托盘统一风格
+- 日志区改为深色终端样式，新增任务进度条与状态徽标
+- 新增目录版打包配置（降低杀软误报率）
+- 修复向导页标题重复、按钮英文等问题
 
 ## 合规声明
 

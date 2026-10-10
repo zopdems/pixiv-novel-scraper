@@ -13,7 +13,7 @@ def set_autostart(enabled: bool) -> bool:
                 exe = sys.executable
                 if not exe.lower().endswith(".exe"):
                     return False
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}" --silent')
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
