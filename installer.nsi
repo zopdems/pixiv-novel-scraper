@@ -26,7 +26,7 @@ Section "主程序（必需）" SecMain
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayName" "Pixiv 小说自动抓取器"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayVersion" "1.3.0"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "Publisher" "Tix"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "Publisher" "pixiv-novel-scraper"
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "NoModify" 1
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "NoRepair" 1
 SectionEnd

@@ -21,6 +21,10 @@ logs/
 # 本机生成的图标缓存
 ui_assets/
 
+# 测试用的真实作品样本（含版权内容，不入库；由 probe_*.py / live_pipeline.py 本地生成）
+tests/live_test.epub
+tests/novel_page_dump.html
+
 # 依赖与编辑器
 node_modules/
 .vscode/
