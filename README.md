@@ -16,6 +16,7 @@
 - **🔍 本地检索**：按标题 / 作者 / 标签检索已收录作品，双击直达文件
 - **🎒 便携与迁移**：数据全在程序目录 `data\` 下；一键导出 / 导入备份 JSON（含作者、设置、Cookie），换电脑无损搬家
 - **⏰ 挂机友好**：系统托盘常驻、每日定时抓取、可选开机自启（静默启动，不弹主窗口，直接驻留托盘）
+- **⚙️ 32 项高级设置**：覆盖「触发与筛选 / 文件输出 / 内容编排 / 更新与去重」四个环节，可开关可调参，默认值全部等价于原有行为，支持一键恢复默认（详见 [高级设置说明](SETTINGS.md)）
 
 ## 界面预览
 
@@ -24,7 +25,7 @@
 - **作者**：小说作者 / 插画作者双名单，支持批量导入、启停开关，双击昵称直达 Pixiv 主页
 - **任务**：手动触发同步，深色终端样式的实时日志，失败 / 远端已删除队列
 - **检索**：按标题 / 作者 / 标签搜索本地书库，双击打开所在目录
-- **设置**：外观主题、存储路径、抓取策略、网络、登录 Cookie、备份迁移
+- **设置**：外观主题、存储路径、抓取策略、文件输出、内容编排、更新策略、网络、登录 Cookie、备份迁移；右上角可一键恢复高级设置默认值
 
 支持**浅色 / 深色双主题**，可在「设置 → 外观」切换，或点击右上角月亮 / 太阳图标快速切换，选择会随配置保存。
 
@@ -32,7 +33,7 @@
 
 ### 方式一：安装包（推荐给普通用户）
 
-1. 下载 `PixivNovelScraper-Setup-v1.3.0.exe`
+1. 下载 `PixivNovelScraper-Setup-v1.4.0.exe`（若杀软误报，改用 `PixivNovelScraper-Setup-v1.4.0-onedir.exe` 目录版）
 2. 运行安装包，**可自选安装位置**（无需管理员权限）
 3. 首次启动按四步引导完成配置：选目录 → 导入 Cookie → 添加作者 → 风险确认
 4. 到「任务」页点「立即抓取」
@@ -55,11 +56,19 @@ python -m PyInstaller --noconfirm PixivNovelScraper.spec
 # 方式 B：目录版（产物 dist\PixivNovelScraper-OneDir\，杀软误报率通常更低）
 python -m PyInstaller --noconfirm PixivNovelScraper-onedir.spec
 
-# 安装包（需 NSIS；项目上级目录 tools\nsis-3.10\ 下已放便携版可直接用）
+# 安装包（需 NSIS；已安装可直接用 "C:\Program Files (x86)\NSIS\makensis.exe"）
+
+# 单文件版安装包 → dist\PixivNovelScraper-Setup-vX.Y.Z.exe
 makensis.exe installer.nsi
+
+# 目录版安装包 → dist\PixivNovelScraper-Setup-vX.Y.Z-onedir.exe（误报率通常更低）
+python -m PyInstaller --noconfirm PixivNovelScraper-onedir.spec
+makensis.exe installer-onedir.nsi
 ```
 
-> 安装前请先修改 `installer.nsi` 里的版本号，与本次发布保持一致。
+> 安装前请先修改两个 nsi 脚本里的版本号，与本次发布保持一致。
+>
+> **打包目录版前务必确认 `dist\PixivNovelScraper-OneDir\` 下没有 `data` 子文件夹**——本地运行过 exe 会生成它，里面是你的配置、索引库和日志，`File /r` 会把它一起打进安装包。发现就先删掉再打包。
 
 ## 获取 Cookie 的两种方式
 
@@ -82,6 +91,7 @@ makensis.exe installer.nsi
 pixiv-novel-scraper/
 ├── run.py                       # 程序入口
 ├── requirements.txt             # 依赖清单
+├── SETTINGS.md                  # 32 项高级设置说明（作用 / 取值范围 / 相互影响）
 ├── installer.nsi                # NSIS 安装包脚本
 ├── PixivNovelScraper.spec       # 打包配置：单文件版
 ├── PixivNovelScraper-onedir.spec# 打包配置：目录版（误报率更低）
@@ -99,6 +109,21 @@ pixiv-novel-scraper/
 ```
 
 ## 更新日志
+
+### v1.4.0
+
+- **新增 32 项高级设置**，覆盖四个环节：触发与筛选、文件输出、内容编排、更新与去重
+- 设置页新增「文件输出 / 内容编排 / 更新策略」三个分组，原「抓取策略」扩展触发与筛选项
+- 新增「恢复默认」按钮：一键还原全部高级设置，不触碰存储路径 / Cookie / 代理 / 主题
+- 作者账号 404 的处理方式可配置为自动停用 / 保持启用 / 本轮跳过，并支持按天数自动复查被停用的作者
+- 定时抓取支持「补跑窗口」，避免开机过晚导致的大延迟补跑
+- 新增筛选维度：标签白名单、标题/简介包含与排除关键词、正文最短字数、每作者单次新增上限
+- 输出可配置：是否按单篇/系列分目录、多页插画平铺或子文件夹、文件名长度与非法字符替换
+- EPUB 内容可裁剪：信息页、封面、简介、原文链接、标签元数据、内嵌插图、章节标题来源、语言标记
+- 更新策略可配置：更新判定方式（时间戳 / 总是重建 / 只补缺失）、旧文件替换、系列复查间隔、远端删除是否标记
+- 数据库升级至 schema v5（新增 `authors.disabled_at`），旧库自动迁移并保留备份
+- **作者状态统一判定**：新增 `app/ui/author_status.py`，停用 / 记录缺失 / 昵称缺失统一显示「已注销」（弱化样式，不拦截双击跳转主页）
+- **新增「已删除作品」标签页**：按作者分组列出远端已删除的小说与插画，已注销 / 已移除作者归入「已注销」分组，双击可跳转作者主页或作品页
 
 ### v1.3.0
 
