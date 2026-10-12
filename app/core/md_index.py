@@ -8,6 +8,40 @@ from .utils import clean_description, format_datetime
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
+def _default_opts() -> dict:
+    return {
+        "include_description": True,
+        "include_stats": True,
+        "single_sort": "publish",
+    }
+
+
+_DEFAULT_OPTS = _default_opts()
+
+
+def md_opts(settings=None) -> dict:
+    """从 Settings 生成 MD 索引选项；settings 为 None 时返回历史默认行为。"""
+    if settings is None:
+        return dict(_DEFAULT_OPTS)
+
+    def _get(key, default):
+        try:
+            v = getattr(settings, key, default)
+        except Exception:
+            v = default
+        return default if v is None else v
+
+    sort = str(_get("md_single_sort", "publish"))
+    if sort not in ("publish", "updated", "id"):
+        sort = "publish"
+
+    return {
+        "include_description": bool(_get("md_include_description", True)),
+        "include_stats": bool(_get("md_include_stats", True)),
+        "single_sort": sort,
+    }
+
+
 def _plain(text: str) -> str:
     return _TAG_RE.sub("", text or "").strip()
 
@@ -16,7 +50,8 @@ def _fmt_dt(value: str) -> str:
     return format_datetime(value)[:16]
 
 
-def _entry_block(novel: dict, level: int) -> list:
+def _entry_block(novel: dict, level: int, opts: dict = None) -> list:
+    opts = opts or _DEFAULT_OPTS
     url = f"https://www.pixiv.net/novel/show.php?id={novel['novel_id']}"
     title = _plain(novel.get("title")) or novel["novel_id"]
     heading = "#" * level
@@ -33,10 +68,11 @@ def _entry_block(novel: dict, level: int) -> list:
     tags = (novel.get("tags") or "").replace(",", ", ").strip(", ")
     if tags:
         lines.append(f"- 标签：{tags}")
-    desc = clean_description(novel.get("description") or "")
-    if desc:
-        lines.append("")
-        lines.extend(f"> {line}".rstrip() for line in desc.split("\n"))
+    if opts["include_description"]:
+        desc = clean_description(novel.get("description") or "")
+        if desc:
+            lines.append("")
+            lines.extend(f"> {line}".rstrip() for line in desc.split("\n"))
     return lines
 
 
@@ -58,12 +94,19 @@ def _illust_block(illust: dict) -> list:
     return lines
 
 
-def render_author_md(author: dict, novels: list, run_stat: dict = None, deleted_series: set = None) -> str:
+def _single_key(opts: dict):
+    if opts["single_sort"] == "updated":
+        return lambda x: (x.get("remote_updated_at") or "", x.get("novel_id") or "")
+    if opts["single_sort"] == "id":
+        return lambda x: (int(x.get("novel_id") or 0),)
+    return lambda x: (x.get("publish_date") or "", x.get("novel_id") or "")
+
+
+def render_author_md(author: dict, novels: list, run_stat: dict = None,
+                     deleted_series: set = None, opts: dict = None) -> str:
+    opts = opts or _DEFAULT_OPTS
     deleted_series = deleted_series or set()
-    singles = sorted(
-        [n for n in novels if not n.get("series_id")],
-        key=lambda x: (x.get("publish_date") or "", x.get("novel_id") or ""),
-    )
+    singles = sorted([n for n in novels if not n.get("series_id")], key=_single_key(opts))
     series_map = {}
     for n in novels:
         if n.get("series_id"):
@@ -82,7 +125,7 @@ def render_author_md(author: dict, novels: list, run_stat: dict = None, deleted_
     deleted_shown = {sid for sid, _ in series_map if sid in deleted_series}
     if deleted_shown:
         lines.append(f"- 已删除系列：{len(deleted_shown)} 个")
-    if run_stat:
+    if run_stat and opts["include_stats"]:
         deleted = run_stat.get("deleted", 0)
         series_deleted = run_stat.get("series_deleted", 0)
         summary = "新增 {} / 更新 {} / 远端删除 {}（单篇 {} / 系列 {}）/ 失败 {}".format(
@@ -98,7 +141,7 @@ def render_author_md(author: dict, novels: list, run_stat: dict = None, deleted_
     ]
     if singles:
         for n in singles:
-            lines += _entry_block(n, 3)
+            lines += _entry_block(n, 3, opts)
             lines.append("")
     else:
         lines.append("（暂无）")
@@ -109,7 +152,7 @@ def render_author_md(author: dict, novels: list, run_stat: dict = None, deleted_
             status_note = "（系列已删除）" if sid in deleted_series else ""
             lines += [f"### {series_title}{status_note}", ""]
             for n in items:
-                lines += _entry_block(n, 4)
+                lines += _entry_block(n, 4, opts)
                 lines.append("")
     else:
         lines.append("（暂无）")
@@ -117,7 +160,8 @@ def render_author_md(author: dict, novels: list, run_stat: dict = None, deleted_
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_illust_md(author: dict, illusts: list, run_stat: dict = None) -> str:
+def render_illust_md(author: dict, illusts: list, run_stat: dict = None, opts: dict = None) -> str:
+    opts = opts or _DEFAULT_OPTS
     name = author.get("author_name") or author["author_id"]
     aid = author["author_id"]
     lines = [
@@ -126,7 +170,7 @@ def render_illust_md(author: dict, illusts: list, run_stat: dict = None) -> str:
         f"- Pixiv：https://www.pixiv.net/users/{aid}",
         f"- 收录插画/漫画：{len(illusts)} 幅",
     ]
-    if run_stat:
+    if run_stat and opts["include_stats"]:
         summary = "新增 {} / 更新 {} / 远端删除 {} / 失败 {}".format(
             run_stat.get("illust_new", 0), run_stat.get("illust_updated", 0),
             run_stat.get("illust_deleted", 0), run_stat.get("illust_failed", 0),
@@ -144,18 +188,20 @@ def render_illust_md(author: dict, illusts: list, run_stat: dict = None) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def write_author_md(path: str, author: dict, novels: list, run_stat: dict = None, deleted_series: set = None) -> None:
+def write_author_md(path: str, author: dict, novels: list, run_stat: dict = None,
+                    deleted_series: set = None, opts: dict = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    content = render_author_md(author, novels, run_stat, deleted_series)
+    content = render_author_md(author, novels, run_stat, deleted_series, opts)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, path)
 
 
-def write_illust_md(path: str, author: dict, illusts: list, run_stat: dict = None) -> None:
+def write_illust_md(path: str, author: dict, illusts: list, run_stat: dict = None,
+                    opts: dict = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    content = render_illust_md(author, illusts, run_stat)
+    content = render_illust_md(author, illusts, run_stat, opts)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)

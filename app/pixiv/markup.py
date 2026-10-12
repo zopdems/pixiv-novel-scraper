@@ -69,7 +69,17 @@ def _convert_page(page_text: str, page_no: int, total_pages: int, illust_files: 
     return "\n".join(out)
 
 
-def convert_novel_markup(content: str, illust_files: dict = None) -> ConvertResult:
+def _first_line(page_text: str, max_len: int = 30) -> str:
+    """取正文首行作为章节标题（已去掉特殊标记）。"""
+    for raw in (page_text or "").split("\n"):
+        line = _TOKEN_RE.sub("", raw).strip()
+        if line:
+            return line[:max_len]
+    return ""
+
+
+def convert_novel_markup(content: str, illust_files: dict = None,
+                         title_style: str = "marker") -> ConvertResult:
     illust_files = illust_files or {}
     pages = content.split("[newpage]")
     total = len(pages)
@@ -80,9 +90,12 @@ def convert_novel_markup(content: str, illust_files: dict = None) -> ConvertResu
     for i, page in enumerate(pages, start=1):
         file_name = f"page_{i:03d}.xhtml"
         heading = None
-        ch_m = re.search(r"\[chapter:([^\[\]]*?)\]", page)
-        if ch_m:
-            heading = ch_m.group(1).strip()
+        if title_style != "page":
+            ch_m = re.search(r"\[chapter:([^\[\]]*?)\]", page)
+            if ch_m:
+                heading = ch_m.group(1).strip()
+            elif title_style == "first_line":
+                heading = _first_line(page)
         title = heading or f"第 {i} 页"
         body = _convert_page(page, i, total, illust_files, result.unknown_markers)
         result.chapters.append(Chapter(file_name=file_name, title=title, body_xhtml=body, page_no=i))

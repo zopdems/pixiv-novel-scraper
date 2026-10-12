@@ -2,11 +2,11 @@ import os
 import shutil
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..config import app_data_dir
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SERIES_RECHECK_DAYS = 30
 
@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS illusts (
 );
 CREATE INDEX IF NOT EXISTS idx_illusts_author ON illusts(author_id);
 CREATE INDEX IF NOT EXISTS idx_illusts_status ON illusts(status);
+"""
+
+# V5：记录作者被停用的时间，用于「停用作者自动复查」
+_SCHEMA_V5 = """
+ALTER TABLE authors ADD COLUMN disabled_at TEXT;
 """
 
 _SCHEMA_V3 = """
@@ -122,6 +127,8 @@ class Database:
             self._conn.executescript(_SCHEMA_V3)
         if version < 4:
             self._conn.executescript(_SCHEMA_V4)
+        if version < 5:
+            self._conn.executescript(_SCHEMA_V5)
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -149,9 +156,37 @@ class Database:
         self._conn.commit()
 
     def set_author_enabled(self, author_id: str, enabled: bool, kind: str = "novel"):
+        if enabled:
+            self._conn.execute(
+                "UPDATE authors SET enabled=?, disabled_at=NULL WHERE author_id=? AND kind=?",
+                (int(enabled), author_id, kind))
+        else:
+            self._conn.execute(
+                "UPDATE authors SET enabled=?, disabled_at=? WHERE author_id=? AND kind=?",
+                (int(enabled), self._now(), author_id, kind))
+        self._conn.commit()
+
+    def authors_due_for_recheck(self, recheck_days: int, kind: str = None) -> list:
+        """被停用且已超过复查间隔的作者；recheck_days<=0 时返回空（即不复查）。"""
+        try:
+            days = int(recheck_days or 0)
+        except (TypeError, ValueError):
+            days = 0
+        if days <= 0:
+            return []
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        sql = "SELECT * FROM authors WHERE enabled=0 AND disabled_at IS NOT NULL AND disabled_at<=?"
+        params = [cutoff]
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind)
+        sql += " ORDER BY disabled_at"
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def reenable_author(self, author_id: str, kind: str) -> None:
         self._conn.execute(
-            "UPDATE authors SET enabled=? WHERE author_id=? AND kind=?", (int(enabled), author_id, kind)
-        )
+            "UPDATE authors SET enabled=1, disabled_at=NULL WHERE author_id=? AND kind=?",
+            (author_id, kind))
         self._conn.commit()
 
     def update_author_name(self, author_id: str, name: str):
@@ -287,7 +322,7 @@ class Database:
             ).fetchall()
         }
 
-    def should_poll_series(self, series_id: str) -> bool:
+    def should_poll_series(self, series_id: str, recheck_days: int = None) -> bool:
         row = self._conn.execute(
             "SELECT marked_at FROM deleted_series WHERE series_id=?", (series_id,)
         ).fetchone()
@@ -297,7 +332,12 @@ class Database:
             marked = datetime.fromisoformat(row[0])
         except ValueError:
             return True
-        return (datetime.now() - marked).days >= SERIES_RECHECK_DAYS
+        try:
+            days = int(SERIES_RECHECK_DAYS if recheck_days is None else recheck_days)
+        except (TypeError, ValueError):
+            days = SERIES_RECHECK_DAYS
+        days = max(1, min(365, days))
+        return (datetime.now() - marked).days >= days
 
     def search_novels(self, keyword: str) -> list:
         like = f"%{keyword}%"

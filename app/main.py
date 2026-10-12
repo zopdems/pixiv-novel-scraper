@@ -58,7 +58,10 @@ def main():
             save_settings(settings)
 
     window = MainWindow(settings, db, logger)
-    scheduler = DailyScheduler(settings.fetch_time)
+    scheduler = DailyScheduler(
+        settings.fetch_time,
+        int(getattr(settings, "catch_up_window_minutes", 0) or 0),
+    )
 
     def notify_report(report):
         if report.aborted_reason:
@@ -77,6 +80,7 @@ def main():
 
     def tick():
         scheduler.set_time(settings.fetch_time)
+        scheduler.set_catch_up_window(int(getattr(settings, "catch_up_window_minutes", 0) or 0))
         if not scheduler.should_run():
             return
         if not load_cookie():
