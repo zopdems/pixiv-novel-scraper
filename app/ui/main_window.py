@@ -6,17 +6,22 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
-    QDoubleSpinBox, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
-    QTimeEdit, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSpinBox, QDoubleSpinBox, QStackedWidget, QTabWidget, QTableWidget,
+    QTableWidgetItem, QTimeEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import credentials
 from ..autostart import set_autostart
-from ..config import save_settings as persist_settings
+from ..config import reset_advanced_settings, save_settings as persist_settings
 from ..core import paths
 from ..core.models import status_label
 from ..pixiv.client import PixivClient
+from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
+                            AUTHOR_STATUS_DELETED, AUTHOR_STATUS_UNKNOWN,
+                            STATUS_TOKEN, author_display_name,
+                            decorate_name_item, resolve_author_status,
+                            status_text)
 from .icons import app_mark, icon
 from .theme import apply_theme, current_mode, resolve_mode, tokens
 from .worker import ScrapeWorker
@@ -288,22 +293,63 @@ class MainWindow(QMainWindow):
             ["昵称", "作者 ID", "状态", "最近抓取", "已收录插画", "已删插画"])
         self.author_tabs.addTab(self.novel_author_table, "小说作者")
         self.author_tabs.addTab(self.illust_author_table, "插画作者")
+        self.author_tabs.addTab(self._build_deleted_works_tab(), "已删除作品")
         tl.addWidget(self.author_tabs, 1)
         outer.addWidget(table_card, 1)
         return page
 
-    def _active_author_kind(self) -> str:
-        return "novel" if self.author_tabs.currentIndex() == 0 else "illust"
+    def _build_deleted_works_tab(self) -> QWidget:
+        """「已删除作品」标签页：按作者分组列出远端已删除的作品。"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
 
-    def _active_author_table(self) -> QTableWidget:
-        return self.novel_author_table if self._active_author_kind() == "novel" else self.illust_author_table
+        self.deleted_summary = QLabel("")
+        self.deleted_summary.setProperty("class", "hint")
+        self.deleted_summary.setWordWrap(True)
+        v.addWidget(self.deleted_summary)
+
+        self.deleted_tree = QTreeWidget()
+        self.deleted_tree.setColumnCount(5)
+        self.deleted_tree.setHeaderLabels(["作品 / 作者", "作品 ID", "分类", "发布时间", "更新时间"])
+        self.deleted_tree.setAlternatingRowColors(True)
+        self.deleted_tree.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.deleted_tree.setVerticalScrollMode(QTreeWidget.ScrollPerPixel)
+        header = self.deleted_tree.header()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        for i, wdt in enumerate([340, 110, 190, 130, 130]):
+            self.deleted_tree.setColumnWidth(i, wdt)
+        self.deleted_tree.itemDoubleClicked.connect(self._on_deleted_double_clicked)
+        v.addWidget(self.deleted_tree, 1)
+        return w
+
+    def _active_author_kind(self):
+        """当前作者名单类型；位于「已删除作品」标签页时返回 None。"""
+        idx = self.author_tabs.currentIndex()
+        if idx == 0:
+            return "novel"
+        if idx == 1:
+            return "illust"
+        return None
+
+    def _active_author_table(self):
+        if self._active_author_kind() == "novel":
+            return self.novel_author_table
+        if self._active_author_kind() == "illust":
+            return self.illust_author_table
+        return None
 
     def _on_author_cell_double_clicked(self, row, col):
-        if col != 0:
-            return
+        # 双击任意列均可跳转主页（含已注销作者，页面为空属预期，不做拦截）
         table = self.sender()
-        aid = table.item(row, 1).text()
-        self._open_pixiv_user(aid)
+        item = table.item(row, 1)
+        if item is None:
+            return
+        aid = item.text().strip()
+        if aid.isdigit():
+            self._open_pixiv_user(aid)
 
     @staticmethod
     def _open_pixiv_user(aid: str):
@@ -316,6 +362,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "输入无效", "作者 ID 应为纯数字")
             return
         kind = self._active_author_kind()
+        if kind is None:
+            QMessageBox.information(self, "提示", "请先切换到「小说作者」或「插画作者」标签页再添加。")
+            return
         if self.db.add_author(text, pending_validate=True, kind=kind):
             self.author_input.clear()
             self.refresh_authors()
@@ -329,6 +378,9 @@ class MainWindow(QMainWindow):
             return
         ids = dlg.ids()
         kind = self._active_author_kind()
+        if kind is None:
+            QMessageBox.information(self, "提示", "请先切换到「小说作者」或「插画作者」标签页再导入。")
+            return
         label = "小说" if kind == "novel" else "插画"
         added = sum(1 for i in ids if self.db.add_author(i, pending_validate=True, kind=kind))
         QMessageBox.information(self, "导入结果",
@@ -337,6 +389,8 @@ class MainWindow(QMainWindow):
 
     def _selected_author_id(self):
         table = self._active_author_table()
+        if table is None:
+            return None
         row = table.currentRow()
         if row < 0:
             return None
@@ -369,12 +423,13 @@ class MainWindow(QMainWindow):
 
     def _fill_author_table(self, table: QTableWidget, kind: str):
         authors = self.db.list_authors(kind=kind)
-        accent = tokens(current_mode())["accent"]
+        tk = tokens(current_mode())
+        accent, muted = tk["accent"], tk["text_muted"]
         table.setSortingEnabled(False)
         table.setRowCount(len(authors))
         for i, a in enumerate(authors):
             aid = a["author_id"]
-            name = a.get("author_name") or ("（待校验）" if a.get("pending_validate") else "（未知）")
+            display, st = author_display_name(a)
             if kind == "novel":
                 counts = [
                     self.db.author_novel_count(aid),
@@ -387,17 +442,10 @@ class MainWindow(QMainWindow):
                     self.db.author_deleted_illust_count(aid),
                 ]
 
-            name_item = QTableWidgetItem(str(name))
-            name_item.setForeground(QColor(accent))
-            font = name_item.font()
-            font.setUnderline(True)
-            name_item.setFont(font)
-            name_item.setToolTip("双击打开 Pixiv 主页")
-            table.setItem(i, 0, name_item)
+            table.setItem(i, 0, decorate_name_item(QTableWidgetItem(display), st, accent, muted))
 
-            enabled = a["enabled"]
-            state_item = QTableWidgetItem("启用" if enabled else "停用")
-            state_item.setForeground(QColor(tokens(current_mode())["success" if enabled else "text_muted"]))
+            state_item = QTableWidgetItem(status_text(st))
+            state_item.setForeground(QColor(tk[STATUS_TOKEN[st]]))
             table.setItem(i, 2, state_item)
 
             table.setItem(i, 1, QTableWidgetItem(str(aid)))
@@ -409,9 +457,117 @@ class MainWindow(QMainWindow):
                 table.setItem(i, 4 + offset, item)
         table.setSortingEnabled(True)
 
+    # ------------------------------------------------ 已删除作品
+    def _fill_deleted_tree(self):
+        tree = self.deleted_tree
+        tk = tokens(current_mode())
+        muted = tk["text_muted"]
+        tree.clear()
+
+        author_rows = {}
+        for kind in ("novel", "illust"):
+            for a in self.db.list_authors(kind=kind):
+                author_rows[(kind, a["author_id"])] = a
+
+        def make_work_item(kind, r):
+            if kind == "novel":
+                wid = str(r.get("novel_id") or "")
+                if r.get("series_id"):
+                    stitle = r.get("series_title") or wid
+                    cat = f"系列《{stitle}》" + (f" 第{r['series_order']}话" if r.get("series_order") else "")
+                else:
+                    cat = "单篇"
+            else:
+                wid = str(r.get("illust_id") or "")
+                cat = "插画 / 漫画"
+            title = str(r.get("title") or "").strip() or "（无标题）"
+            it = QTreeWidgetItem([
+                title, wid, cat,
+                str(r.get("publish_date") or "-")[:16].replace("T", " "),
+                str(r.get("remote_updated_at") or "-")[:16].replace("T", " "),
+            ])
+            it.setForeground(0, QColor(muted))
+            it.setForeground(1, QColor(muted))
+            it.setToolTip(0, "该作品在远端已被删除，本地文件保留；双击打开作品页")
+            it.setData(0, Qt.UserRole, ("work", kind, wid))
+            return it
+
+        data = {}
+        for kind in ("novel", "illust"):
+            works = self.db.deleted_novels() if kind == "novel" else self.db.deleted_illusts()
+            for r in works:
+                aid = str(r.get("author_id") or "").strip()
+                data.setdefault((kind, aid), []).append(r)
+
+        normal_nodes, deleted_nodes = [], []
+        for (kind, aid), rows in sorted(data.items(), key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1])):
+            row = author_rows.get((kind, aid))
+            if row is None:
+                display, st = AUTHOR_DELETED_LABEL, AUTHOR_STATUS_DELETED
+            else:
+                display, st = author_display_name(row)
+            kind_label = "小说" if kind == "novel" else "插画"
+            node = QTreeWidgetItem([
+                f"{display} · ID {aid or '未知'} · {kind_label}（{len(rows)}）", "", "", "", ""
+            ])
+            node.setData(0, Qt.UserRole, ("author", kind, aid))
+            for r in rows:
+                node.addChild(make_work_item(kind, r))
+            (deleted_nodes if st == AUTHOR_STATUS_DELETED else normal_nodes).append(node)
+
+        for node in normal_nodes:
+            node.setForeground(0, QColor(tk["text"]))
+            tree.addTopLevelItem(node)
+
+        if deleted_nodes:
+            group = QTreeWidgetItem([
+                AUTHOR_DELETED_LABEL, "", f"{len(deleted_nodes)} 位作者", "", ""
+            ])
+            group.setForeground(0, QColor(muted))
+            font = group.font(0)
+            font.setBold(True)
+            group.setFont(0, font)
+            group.setToolTip(0, "账号已停用 / 已注销或信息缺失；双击作者行仍可打开其主页")
+            for node in deleted_nodes:
+                node.setForeground(0, QColor(muted))
+                group.addChild(node)
+            tree.addTopLevelItem(group)
+
+        tree.expandAll()
+        total_works = sum(len(v) for v in data.values())
+        if not data:
+            self.deleted_summary.setText(
+                "暂无已删除作品。远端被删除的作品会自动归集到这里（本地文件保留）。")
+        else:
+            self.deleted_summary.setText(
+                f"共 {len(data)} 位作者有已删除作品，合计 {total_works} 部/幅；"
+                f"其中 {AUTHOR_DELETED_LABEL}作者 {len(deleted_nodes)} 位。"
+                "本地文件均已保留。双击作者行打开主页，双击作品行打开作品页。")
+
+    def _on_deleted_double_clicked(self, item, col):
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return  # 「已注销」分组行本身不跳转
+        tag = data[0]
+        if tag == "author":
+            aid = str(data[2] or "")
+            if aid.isdigit():
+                self._open_pixiv_user(aid)
+        elif tag == "work":
+            _, kind, wid = data
+            import webbrowser
+            if kind == "novel":
+                webbrowser.open(f"https://www.pixiv.net/novel/show.php?id={wid}")
+            else:
+                webbrowser.open(f"https://www.pixiv.net/artworks/{wid}")
+
     def refresh_authors(self):
         self._fill_author_table(self.novel_author_table, "novel")
         self._fill_author_table(self.illust_author_table, "illust")
+        try:
+            self._fill_deleted_tree()
+        except Exception:
+            self.deleted_summary.setText("已删除作品列表加载失败，请重试或查看日志。")
         try:
             n = len(self.db.list_authors(kind="novel"))
             m = len(self.db.list_authors(kind="illust"))
@@ -700,6 +856,11 @@ class MainWindow(QMainWindow):
         btn_save.clicked.connect(self.save_settings)
         head.addWidget(btn_save)
 
+        btn_reset = QPushButton("恢复默认")
+        btn_reset.setToolTip("把「高级设置」恢复为默认值，不影响存储路径 / Cookie / 代理 / 主题")
+        btn_reset.clicked.connect(self.reset_advanced)
+        head.addWidget(btn_reset)
+
         body = QHBoxLayout()
         body.setSpacing(12)
         outer.addLayout(body, 1)
@@ -708,7 +869,10 @@ class MainWindow(QMainWindow):
         nav_card.setFixedWidth(172)
         self.settings_nav = QListWidget()
         self.settings_nav.setObjectName("subnav")
-        self.settings_nav.addItems(["外观", "存储路径", "抓取策略", "网络", "登录 Cookie", "系统"])
+        self.settings_nav.addItems([
+            "外观", "存储路径", "抓取策略", "文件输出", "内容编排", "更新策略",
+            "网络", "登录 Cookie", "系统",
+        ])
         nc.addWidget(self.settings_nav)
         body.addWidget(nav_card)
 
@@ -729,8 +893,33 @@ class MainWindow(QMainWindow):
             cl.addLayout(f)
             outer_l.addWidget(card)
             outer_l.addStretch(1)
-            self.settings_stack.addWidget(w)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(w)
+            self.settings_stack.addWidget(scroll)
             return f
+
+        def section(form: QFormLayout, text: str) -> QLabel:
+            lab = QLabel(text)
+            lab.setProperty("class", "section-title")
+            form.addRow(lab)
+            return lab
+
+        def hint(form: QFormLayout, text: str) -> QLabel:
+            lab = QLabel(text)
+            lab.setWordWrap(True)
+            lab.setProperty("class", "hint")
+            form.addRow("", lab)
+            return lab
+
+        def combo(items, current) -> QComboBox:
+            c = QComboBox()
+            for label, value in items:
+                c.addItem(label, value)
+            i = c.findData(current)
+            c.setCurrentIndex(i if i >= 0 else 0)
+            return c
 
         s = self.settings
 
@@ -822,6 +1011,199 @@ class MainWindow(QMainWindow):
         self.set_blacklist = QLineEdit(",".join(s.tag_blacklist))
         self.set_blacklist.setPlaceholderText("多个标签用英文逗号分隔")
         form.addRow("标签黑名单", self.set_blacklist)
+
+        section(form, "高级 · 触发与筛选")
+        self.set_404 = combo([
+            ("自动停用（默认）", "disable"),
+            ("保持启用，仅记录", "keep"),
+            ("本轮跳过，不改状态", "skip"),
+        ], getattr(s, "author_404_action", "disable"))
+        form.addRow("作者账号 404 时", self.set_404)
+        hint(form, "仅当「拉取作者作品清单」返回 404 时触发；单部作品 404 不受此项影响。")
+
+        self.set_recheck = QSpinBox()
+        self.set_recheck.setRange(0, 365)
+        self.set_recheck.setSuffix(" 天")
+        self.set_recheck.setValue(int(getattr(s, "disabled_recheck_days", 0) or 0))
+        form.addRow("停用作者自动复查", self.set_recheck)
+        hint(form, "0 = 不复查（默认）。设为 N 后，被停用满 N 天的作者会在下一轮自动重新启用并复查。")
+
+        self.set_catchup = QSpinBox()
+        self.set_catchup.setRange(0, 1440)
+        self.set_catchup.setSuffix(" 分钟")
+        self.set_catchup.setValue(int(getattr(s, "catch_up_window_minutes", 0) or 0))
+        form.addRow("定时补跑窗口", self.set_catchup)
+        hint(form, "0 = 当天任意时间启动都会补跑（默认）。设为 60 表示只在定时点后 1 小时内补跑。")
+
+        self.set_cap = QSpinBox()
+        self.set_cap.setRange(0, 9999)
+        self.set_cap.setSpecialValueText("不限")
+        self.set_cap.setValue(int(getattr(s, "max_novels_per_author", 0) or 0))
+        form.addRow("每作者单次新增上限", self.set_cap)
+        hint(form, "0 = 不限（默认）。仅限制「本次新发现」的作品数，本地缺失文件的补下载不受限制。")
+
+        self.set_whitelist = QLineEdit(",".join(getattr(s, "tag_whitelist", []) or []))
+        self.set_whitelist.setPlaceholderText("留空 = 不限制；多个标签用英文逗号分隔")
+        form.addRow("标签白名单", self.set_whitelist)
+        hint(form, "设了白名单后，只有命中其中至少一个标签的作品才会被抓取。与黑名单同时存在时，黑名单优先。")
+
+        self.set_kw_in = QLineEdit(getattr(s, "keyword_include", "") or "")
+        self.set_kw_in.setPlaceholderText("留空 = 不限制；多个词用英文逗号分隔")
+        form.addRow("标题/简介包含", self.set_kw_in)
+
+        self.set_kw_ex = QLineEdit(getattr(s, "keyword_exclude", "") or "")
+        self.set_kw_ex.setPlaceholderText("留空 = 不限制；多个词用英文逗号分隔")
+        form.addRow("标题/简介排除", self.set_kw_ex)
+
+        self.set_minlen = QSpinBox()
+        self.set_minlen.setRange(0, 1000000)
+        self.set_minlen.setSingleStep(100)
+        self.set_minlen.setSuffix(" 字")
+        self.set_minlen.setSpecialValueText("不限")
+        self.set_minlen.setValue(int(getattr(s, "min_text_length", 0) or 0))
+        form.addRow("正文最短字数", self.set_minlen)
+        hint(form, "0 = 不限（默认）。仅对小说生效，插画/漫画不受影响。")
+
+        # ---- 文件输出 ----
+        form = make_page()
+        section(form, "目录与命名")
+        self.set_series_dir = QCheckBox("按「单篇 / 系列」分子目录")
+        self.set_series_dir.setChecked(bool(getattr(s, "organize_by_series", True)))
+        form.addRow("", self.set_series_dir)
+        hint(form, "关闭后所有作品直接平铺在作者目录下，不再区分单篇与系列子目录。")
+
+        self.set_mp_style = combo([
+            ("每部作品一个子文件夹（默认）", "folder"),
+            ("平铺到作者目录", "flat"),
+        ], getattr(s, "illust_multipage_style", "folder"))
+        form.addRow("多页插画存放方式", self.set_mp_style)
+
+        self.set_namelen = QSpinBox()
+        self.set_namelen.setRange(40, 200)
+        self.set_namelen.setValue(int(getattr(s, "filename_max_length", 120) or 120))
+        self.set_namelen.setSuffix(" 字符")
+        form.addRow("文件名最大长度", self.set_namelen)
+        hint(form, "超出部分会被截断；标题 / 作者 / 系列名的截断长度会按同比例缩放。")
+
+        self.set_illrep = QLineEdit(getattr(s, "illegal_char_replacement", "_") or "_")
+        self.set_illrep.setMaxLength(3)
+        self.set_illrep.setPlaceholderText("默认 _")
+        form.addRow("非法字符替换为", self.set_illrep)
+        hint(form, r'用于替换 \ / : * ? " < > | 等不能出现在文件名里的字符。')
+
+        section(form, "Markdown 索引")
+        self.set_md_index = QCheckBox("生成作者索引 MD")
+        self.set_md_index.setChecked(bool(getattr(s, "write_md_index", True)))
+        form.addRow("", self.set_md_index)
+
+        self.set_md_desc = QCheckBox("索引条目包含作品简介")
+        self.set_md_desc.setChecked(bool(getattr(s, "md_include_description", True)))
+        form.addRow("", self.set_md_desc)
+
+        self.set_md_stats = QCheckBox("索引头部包含本轮抓取统计")
+        self.set_md_stats.setChecked(bool(getattr(s, "md_include_stats", True)))
+        form.addRow("", self.set_md_stats)
+
+        self.set_md_sort = combo([
+            ("按发布时间（默认）", "publish"),
+            ("按更新时间", "updated"),
+            ("按作品 ID", "id"),
+        ], getattr(s, "md_single_sort", "publish"))
+        form.addRow("单篇排序方式", self.set_md_sort)
+        hint(form, "仅影响「单篇」段落的顺序；系列内始终按系列顺序号排序。")
+
+        # ---- 内容编排 ----
+        form = make_page()
+        section(form, "作品信息页")
+        self.set_info_page = QCheckBox("生成「作品信息」页")
+        self.set_info_page.setChecked(bool(getattr(s, "epub_include_info_page", True)))
+        form.addRow("", self.set_info_page)
+        hint(form, "关闭后 EPUB 直接从正文开始，简介 / 标签 / 时间等信息不再写入书中。")
+
+        self.set_desc = QCheckBox("信息页包含作品简介")
+        self.set_desc.setChecked(bool(getattr(s, "epub_include_description", True)))
+        form.addRow("", self.set_desc)
+
+        self.set_src_url = QCheckBox("信息页包含原文链接")
+        self.set_src_url.setChecked(bool(getattr(s, "epub_include_source_url", True)))
+        form.addRow("", self.set_src_url)
+
+        self.set_tags_meta = QCheckBox("标签写入书籍元数据")
+        self.set_tags_meta.setChecked(bool(getattr(s, "epub_include_tags_meta", True)))
+        form.addRow("", self.set_tags_meta)
+        hint(form, "关闭后标签不再写入 EPUB 元数据（阅读器里可能搜不到），信息页仍会显示标签。")
+
+        section(form, "封面与插图")
+        self.set_cover = QCheckBox("嵌入封面图")
+        self.set_cover.setChecked(bool(getattr(s, "epub_include_cover", True)))
+        form.addRow("", self.set_cover)
+
+        self.set_cover_fb = QCheckBox("无封面时用第一张插图代替")
+        self.set_cover_fb.setChecked(bool(getattr(s, "epub_cover_fallback", True)))
+        form.addRow("", self.set_cover_fb)
+
+        self.set_inserts = QCheckBox("下载正文内嵌插图")
+        self.set_inserts.setChecked(bool(getattr(s, "epub_download_inserts", True)))
+        form.addRow("", self.set_inserts)
+        hint(form, "关闭后正文里的插图位置会保留原始标记文字，EPUB 体积显著变小。")
+
+        section(form, "章节与语言")
+        self.set_ch_title = combo([
+            ("优先用章节标记（默认）", "marker"),
+            ("统一用「第 N 页」", "page"),
+            ("无标记时用正文首行", "first_line"),
+        ], getattr(s, "chapter_title_style", "marker"))
+        form.addRow("章节标题来源", self.set_ch_title)
+
+        self.set_lang = QLineEdit(getattr(s, "epub_language", "ja") or "ja")
+        self.set_lang.setMaxLength(12)
+        self.set_lang.setPlaceholderText("默认 ja")
+        form.addRow("书籍语言标记", self.set_lang)
+        hint(form, "写入 EPUB 的 language 字段，如 ja / zh / en。仅影响阅读器识别，不影响正文。")
+
+        # ---- 更新策略 ----
+        form = make_page()
+        section(form, "更新判定")
+        self.set_upd_mode = combo([
+            ("比较远端更新时间（默认）", "timestamp"),
+            ("每次都重新生成", "always"),
+            ("只补缺失文件", "never"),
+        ], getattr(s, "update_mode", "timestamp"))
+        form.addRow("更新判定方式", self.set_upd_mode)
+        hint(form, "「每次都重新生成」会忽略时间戳重复打包，流量与耗时都会上升。")
+
+        self.set_redl = QCheckBox("本地文件缺失时重新下载")
+        self.set_redl.setChecked(bool(getattr(s, "redownload_missing", True)))
+        form.addRow("", self.set_redl)
+
+        self.set_retry = QCheckBox("每轮开头优先重试失败队列")
+        self.set_retry.setChecked(bool(getattr(s, "retry_failed_each_run", True)))
+        form.addRow("", self.set_retry)
+        hint(form, "登录失效类失败不在此列，需要重新导入 Cookie 后才会重试。")
+
+        self.set_repl_old = QCheckBox("新文件生成后删除旧文件")
+        self.set_repl_old.setChecked(bool(getattr(s, "replace_old_file", True)))
+        form.addRow("", self.set_repl_old)
+        hint(form, "仅当新旧路径不同才会删除。关闭后可能同时留下新旧两份文件。")
+
+        section(form, "删除与迁移")
+        self.set_series_recheck = QSpinBox()
+        self.set_series_recheck.setRange(1, 365)
+        self.set_series_recheck.setSuffix(" 天")
+        self.set_series_recheck.setValue(int(getattr(s, "series_recheck_days", 30) or 30))
+        form.addRow("已删除系列复查间隔", self.set_series_recheck)
+
+        self.set_del_action = combo([
+            ("保留本地文件并标记（默认）", "keep"),
+            ("保留本地文件，不做标记", "silent"),
+        ], getattr(s, "remote_deleted_action", "keep"))
+        form.addRow("作品在远端被删除时", self.set_del_action)
+        hint(form, "两种方式都不会删除你本地的文件，区别只在于是否标记为「远端已删除」。")
+
+        self.set_rename_mig = QCheckBox("作者改昵称时自动迁移目录")
+        self.set_rename_mig.setChecked(bool(getattr(s, "author_rename_migrate", True)))
+        form.addRow("", self.set_rename_mig)
+        hint(form, "关闭后已下载的文件保留在原目录，但新下载的作品会落到新昵称目录。")
 
         # ---- 网络 ----
         form = make_page()
@@ -984,7 +1366,98 @@ class MainWindow(QMainWindow):
         s.proxy.username = self.proxy_user.text().strip()
         if self.proxy_pass.text():
             s.proxy.password = self.proxy_pass.text()
+
+        # ---- 高级设置 ----
+        s.author_404_action = self.set_404.currentData() or "disable"
+        s.disabled_recheck_days = int(self.set_recheck.value())
+        s.catch_up_window_minutes = int(self.set_catchup.value())
+        s.max_novels_per_author = int(self.set_cap.value())
+        s.tag_whitelist = [t.strip() for t in self.set_whitelist.text().split(",") if t.strip()]
+        s.keyword_include = self.set_kw_in.text().strip()
+        s.keyword_exclude = self.set_kw_ex.text().strip()
+        s.min_text_length = int(self.set_minlen.value())
+        s.organize_by_series = self.set_series_dir.isChecked()
+        s.illust_multipage_style = self.set_mp_style.currentData() or "folder"
+        s.filename_max_length = int(self.set_namelen.value())
+        s.illegal_char_replacement = self.set_illrep.text().strip() or "_"
+        s.write_md_index = self.set_md_index.isChecked()
+        s.md_include_description = self.set_md_desc.isChecked()
+        s.md_include_stats = self.set_md_stats.isChecked()
+        s.md_single_sort = self.set_md_sort.currentData() or "publish"
+        s.epub_include_info_page = self.set_info_page.isChecked()
+        s.epub_include_description = self.set_desc.isChecked()
+        s.epub_include_source_url = self.set_src_url.isChecked()
+        s.epub_include_tags_meta = self.set_tags_meta.isChecked()
+        s.epub_include_cover = self.set_cover.isChecked()
+        s.epub_cover_fallback = self.set_cover_fb.isChecked()
+        s.epub_download_inserts = self.set_inserts.isChecked()
+        s.chapter_title_style = self.set_ch_title.currentData() or "marker"
+        s.epub_language = self.set_lang.text().strip() or "ja"
+        s.update_mode = self.set_upd_mode.currentData() or "timestamp"
+        s.redownload_missing = self.set_redl.isChecked()
+        s.retry_failed_each_run = self.set_retry.isChecked()
+        s.replace_old_file = self.set_repl_old.isChecked()
+        s.series_recheck_days = int(self.set_series_recheck.value())
+        s.remote_deleted_action = self.set_del_action.currentData() or "keep"
+        s.author_rename_migrate = self.set_rename_mig.isChecked()
         return s
+
+    def _sync_advanced_controls(self):
+        """把 settings 中的高级设置回填到界面控件。"""
+        s = self.settings
+
+        def _set_combo(w: QComboBox, value):
+            i = w.findData(value)
+            w.setCurrentIndex(i if i >= 0 else 0)
+
+        _set_combo(self.set_404, getattr(s, "author_404_action", "disable"))
+        self.set_recheck.setValue(int(getattr(s, "disabled_recheck_days", 0) or 0))
+        self.set_catchup.setValue(int(getattr(s, "catch_up_window_minutes", 0) or 0))
+        self.set_cap.setValue(int(getattr(s, "max_novels_per_author", 0) or 0))
+        self.set_whitelist.setText(",".join(getattr(s, "tag_whitelist", []) or []))
+        self.set_kw_in.setText(getattr(s, "keyword_include", "") or "")
+        self.set_kw_ex.setText(getattr(s, "keyword_exclude", "") or "")
+        self.set_minlen.setValue(int(getattr(s, "min_text_length", 0) or 0))
+        self.set_series_dir.setChecked(bool(getattr(s, "organize_by_series", True)))
+        _set_combo(self.set_mp_style, getattr(s, "illust_multipage_style", "folder"))
+        self.set_namelen.setValue(int(getattr(s, "filename_max_length", 120) or 120))
+        self.set_illrep.setText(getattr(s, "illegal_char_replacement", "_") or "_")
+        self.set_md_index.setChecked(bool(getattr(s, "write_md_index", True)))
+        self.set_md_desc.setChecked(bool(getattr(s, "md_include_description", True)))
+        self.set_md_stats.setChecked(bool(getattr(s, "md_include_stats", True)))
+        _set_combo(self.set_md_sort, getattr(s, "md_single_sort", "publish"))
+        self.set_info_page.setChecked(bool(getattr(s, "epub_include_info_page", True)))
+        self.set_desc.setChecked(bool(getattr(s, "epub_include_description", True)))
+        self.set_src_url.setChecked(bool(getattr(s, "epub_include_source_url", True)))
+        self.set_tags_meta.setChecked(bool(getattr(s, "epub_include_tags_meta", True)))
+        self.set_cover.setChecked(bool(getattr(s, "epub_include_cover", True)))
+        self.set_cover_fb.setChecked(bool(getattr(s, "epub_cover_fallback", True)))
+        self.set_inserts.setChecked(bool(getattr(s, "epub_download_inserts", True)))
+        _set_combo(self.set_ch_title, getattr(s, "chapter_title_style", "marker"))
+        self.set_lang.setText(getattr(s, "epub_language", "ja") or "ja")
+        _set_combo(self.set_upd_mode, getattr(s, "update_mode", "timestamp"))
+        self.set_redl.setChecked(bool(getattr(s, "redownload_missing", True)))
+        self.set_retry.setChecked(bool(getattr(s, "retry_failed_each_run", True)))
+        self.set_repl_old.setChecked(bool(getattr(s, "replace_old_file", True)))
+        self.set_series_recheck.setValue(int(getattr(s, "series_recheck_days", 30) or 30))
+        _set_combo(self.set_del_action, getattr(s, "remote_deleted_action", "keep"))
+        self.set_rename_mig.setChecked(bool(getattr(s, "author_rename_migrate", True)))
+
+    def reset_advanced(self):
+        answer = QMessageBox.question(
+            self, "恢复默认",
+            "将把全部「高级设置」恢复为默认值（等价于本软件原本的行为）。\n\n"
+            "不受影响：存储路径、Cookie、代理、主题、开机自启、每日抓取时间等基础配置。\n\n"
+            "是否继续？")
+        if answer != QMessageBox.Yes:
+            return
+        reset_advanced_settings(self.settings)
+        self._sync_advanced_controls()
+        try:
+            persist_settings(self.settings)
+        except Exception:
+            pass
+        QMessageBox.information(self, "恢复默认", "已恢复默认值并保存。")
 
     def save_settings(self):
         old_md_mode = self.settings.md_separate
