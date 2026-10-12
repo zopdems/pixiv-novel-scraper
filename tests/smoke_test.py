@@ -70,7 +70,7 @@ check("同名自身不冲突", paths.resolve_collision(_exist, {"novel_id": "7"}
 # 3. 数据库
 tmp = tempfile.mkdtemp()
 db = Database(path=os.path.join(tmp, "t.db"))
-check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 4)
+check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 5)
 check("新增作者", db.add_author("100", "作者甲") is True)
 check("重复作者拒绝", db.add_author("100") is False)
 check("同 ID 可入插画名单", db.add_author("100", kind="illust") is True)
@@ -321,6 +321,56 @@ import logging
 record = logging.LogRecord("t", logging.INFO, "", 0, "cookie PHPSESSID=secret123 已使用", (), None)
 SensitiveFilter().filter(record)
 check("日志脱敏", "secret123" not in record.msg)
+
+# 10. 作者状态统一判定
+from app.ui.author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
+                                  AUTHOR_STATUS_DELETED, AUTHOR_STATUS_PENDING,
+                                  AUTHOR_STATUS_UNKNOWN, author_display_name,
+                                  resolve_author_status, status_text)
+check("判定：停用视为已注销", resolve_author_status(
+    {"author_id": "1", "author_name": "甲", "enabled": 0}) == AUTHOR_STATUS_DELETED)
+check("判定：记录缺失视为已注销", resolve_author_status(None) == AUTHOR_STATUS_DELETED)
+check("判定：ID 为空视为已注销", resolve_author_status(
+    {"author_id": "", "author_name": "甲", "enabled": 1}) == AUTHOR_STATUS_DELETED)
+check("判定：昵称缺失且非待校验视为已注销", resolve_author_status(
+    {"author_id": "1", "author_name": "", "enabled": 1, "pending_validate": 0}) == AUTHOR_STATUS_DELETED)
+check("判定：昵称缺失但待校验 → 待校验", resolve_author_status(
+    {"author_id": "1", "author_name": "", "enabled": 1, "pending_validate": 1}) == AUTHOR_STATUS_PENDING)
+check("判定：信息齐全 → 正常", resolve_author_status(
+    {"author_id": "1", "author_name": "甲", "enabled": 1}) == AUTHOR_STATUS_ACTIVE)
+check("判定：数据异常（字段类型错误）→ 未知", resolve_author_status(
+    {"author_id": "1", "author_name": "甲", "enabled": "abc"}) == AUTHOR_STATUS_UNKNOWN)
+check("判定：残缺对象（无字段）→ 兜底已注销",
+      resolve_author_status(object()) == AUTHOR_STATUS_DELETED)
+check("兜底：已注销且无昵称显示「已注销」",
+      author_display_name({"author_id": "1", "author_name": "", "enabled": 0})
+      == (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_DELETED))
+check("兜底：已注销且保留原昵称", author_display_name(
+    {"author_id": "1", "author_name": "甲", "enabled": 0}) == ("甲（已注销）", AUTHOR_STATUS_DELETED))
+check("兜底：任何输入都不产生空白显示名",
+      all(author_display_name(x)[0] for x in
+          [None, {}, {"author_id": "1", "author_name": "  ", "enabled": 1}]))
+check("文案：状态列", status_text(AUTHOR_STATUS_DELETED) == "已注销"
+      and status_text(AUTHOR_STATUS_PENDING) == "待校验"
+      and status_text(AUTHOR_STATUS_UNKNOWN) == "信息加载失败"
+      and status_text(AUTHOR_STATUS_ACTIVE) == "启用")
+
+# 11. 已删除作品归集查询
+db5 = Database(path=os.path.join(tmp, "del.db"))
+db5.add_author("300", "作者丙", kind="novel")
+db5.upsert_novel({"novel_id": "5001", "author_id": "300", "author_name": "作者丙",
+                  "title": "作品甲", "status": "ok", "local_path": ""})
+db5.set_novel_status("5001", "deleted")
+db5.upsert_illust({"illust_id": "6001", "author_id": "300", "author_name": "作者丙",
+                   "title": "图甲", "status": "ok", "local_path": ""})
+db5.set_illust_status("6001", "deleted")
+_dn = db5.deleted_novels()
+_di = db5.deleted_illusts()
+check("已删除作品：小说可查询", len(_dn) == 1 and _dn[0]["title"] == "作品甲")
+check("已删除作品：插画可查询", len(_di) == 1 and _di[0]["illust_id"] == "6001")
+check("已删除作品：已删除不计入收录数",
+      db5.author_novel_count("300") == 0 and db5.author_deleted_novel_count("300") == 1)
+db5.close()
 
 print()
 if failures:
