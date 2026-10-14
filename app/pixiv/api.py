@@ -53,6 +53,29 @@ def get_user_name(client: PixivClient, user_id: str) -> str:
     return body.get("name") or ""
 
 
+def get_user_status(client: PixivClient, user_id: str) -> tuple:
+    """查询作者是否仍然存在，返回 (exists: bool, name: str)。
+
+    已注销 / 不存在的账号，该接口会返回 HTTP 404 且
+    error=true、提示「该用户已离开 pixiv 或该 ID 不存在」。
+
+    注意：不能用 profile/all 判断是否注销——已注销账号的 profile/all
+    仍会返回 HTTP 200，只是各作品列表为空，无法与「零作品的新账号」区分。
+    """
+    try:
+        data = client.get_json(f"{client.BASE}/ajax/user/{user_id}?lang=zh")
+    except PixivRequestError as e:
+        if e.kind == "not_found":
+            return False, ""
+        raise
+    if data.get("error"):
+        return False, ""
+    body = data.get("body") or {}
+    if not body or not (body.get("userId") or body.get("name")):
+        return False, ""
+    return True, (body.get("name") or "")
+
+
 def get_novel_detail(client: PixivClient, novel_id: str) -> tuple:
     data = client.get_json(f"{client.BASE}/ajax/novel/{novel_id}?lang=zh")
     body = data.get("body") or {}

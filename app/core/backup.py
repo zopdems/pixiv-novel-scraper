@@ -1,9 +1,10 @@
 import json
+import os
 import time
 from dataclasses import asdict
 
 from .. import credentials
-from ..config import ProxyConfig, Settings, save_settings
+from ..config import ProxyConfig, Settings, app_data_dir, save_settings
 
 BACKUP_VERSION = 2
 
@@ -27,6 +28,38 @@ def export_backup(path: str, settings: Settings, authors: list, cookie: str) -> 
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def auto_backup_dir() -> str:
+    """自动备份存放目录（data/backups），与 data 同属被 gitignore 的运行时数据。"""
+    return os.path.join(app_data_dir(), "backups")
+
+
+def create_auto_backup(settings: Settings, db, cookie: str, keep: int = 5,
+                       logger=None) -> str:
+    """抓取前的滚动自动备份，返回本次备份文件路径；失败返回空串。
+
+    注意：备份**明文包含 Cookie**（与手动导出一致），存放在本地 data/backups 下，
+    请勿外传或上传。超出 keep 份数的旧备份会被删除。
+    """
+    directory = auto_backup_dir()
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"backup_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    export_backup(path, settings, db.list_authors(), cookie or "")
+    try:
+        keep_n = max(1, min(50, int(keep or 1)))
+    except (TypeError, ValueError):
+        keep_n = 5
+    files = sorted(f for f in os.listdir(directory)
+                   if f.startswith("backup_") and f.endswith(".json"))
+    for name in files[:-keep_n]:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+    if logger:
+        logger.info("抓取前自动备份：%s（保留最近 %d 份，含 Cookie，请勿外传）", path, keep_n)
+    return path
 
 
 def import_backup(path: str, db) -> dict:

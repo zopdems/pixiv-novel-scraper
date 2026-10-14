@@ -113,6 +113,10 @@ class Settings:
     remote_deleted_action: str = "keep"   # 远端删除：keep=保留文件并标记(原行为) / silent=保留不标记
     author_rename_migrate: bool = True    # 作者改昵称时自动迁移目录(原行为 True)
 
+    # --- 五、抓取前自动备份 ---
+    auto_backup_enabled: bool = True      # 每轮抓取前自动备份索引与设置(含 Cookie)
+    auto_backup_keep: int = 5             # 自动备份保留份数
+
     @property
     def md_separate(self) -> bool:
         return bool(self.md_root.strip())
@@ -163,6 +167,8 @@ ADVANCED_SETTING_KEYS = [
     "update_mode", "redownload_missing", "retry_failed_each_run",
     "replace_old_file", "series_recheck_days", "remote_deleted_action",
     "author_rename_migrate",
+    # 五、抓取前自动备份
+    "auto_backup_enabled", "auto_backup_keep",
 ]
 
 

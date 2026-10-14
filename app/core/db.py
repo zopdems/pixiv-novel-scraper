@@ -6,9 +6,13 @@ from datetime import datetime, timedelta
 
 from ..config import app_data_dir
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SERIES_RECHECK_DAYS = 30
+
+# 作者停用原因
+DISABLE_REASON_DEACTIVATED = "deactivated"  # 账号已注销 / 不存在（抓取时自动判定）
+DISABLE_REASON_MANUAL = "manual"            # 用户手动停用
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS authors (
@@ -67,6 +71,19 @@ CREATE INDEX IF NOT EXISTS idx_illusts_status ON illusts(status);
 # V5：记录作者被停用的时间，用于「停用作者自动复查」
 _SCHEMA_V5 = """
 ALTER TABLE authors ADD COLUMN disabled_at TEXT;
+"""
+
+# V6：区分「账号已注销」与「手动停用」
+# 迁移时对历史数据做尽力推断：
+#   - 有 disabled_at（v5 之后停用）→ 多为抓取时自动判定的注销
+#   - 无 disabled_at（v5 之前停用）→ 多为手动停用
+# old 版本无法 100% 还原，用户可通过开关按钮重新写入准确原因。
+_SCHEMA_V6 = """
+ALTER TABLE authors ADD COLUMN disabled_reason TEXT;
+UPDATE authors SET disabled_reason='deactivated'
+ WHERE enabled=0 AND disabled_at IS NOT NULL AND disabled_reason IS NULL;
+UPDATE authors SET disabled_reason='manual'
+ WHERE enabled=0 AND disabled_at IS NULL AND disabled_reason IS NULL;
 """
 
 _SCHEMA_V3 = """
@@ -129,6 +146,8 @@ class Database:
             self._conn.executescript(_SCHEMA_V4)
         if version < 5:
             self._conn.executescript(_SCHEMA_V5)
+        if version < 6:
+            self._conn.executescript(_SCHEMA_V6)
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -155,16 +174,26 @@ class Database:
         self._conn.execute("DELETE FROM authors WHERE author_id=? AND kind=?", (author_id, kind))
         self._conn.commit()
 
-    def set_author_enabled(self, author_id: str, enabled: bool, kind: str = "novel"):
+    def set_author_enabled(self, author_id: str, enabled: bool, kind: str = "novel",
+                           reason: str = ""):
+        """启用 / 停用作者。reason 用于区分「账号已注销」与「手动停用」，启用时自动清空。"""
         if enabled:
             self._conn.execute(
-                "UPDATE authors SET enabled=?, disabled_at=NULL WHERE author_id=? AND kind=?",
+                "UPDATE authors SET enabled=?, disabled_at=NULL, disabled_reason=NULL"
+                " WHERE author_id=? AND kind=?",
                 (int(enabled), author_id, kind))
         else:
             self._conn.execute(
-                "UPDATE authors SET enabled=?, disabled_at=? WHERE author_id=? AND kind=?",
-                (int(enabled), self._now(), author_id, kind))
+                "UPDATE authors SET enabled=?, disabled_at=?, disabled_reason=?"
+                " WHERE author_id=? AND kind=?",
+                (int(enabled), self._now(), reason or "", author_id, kind))
         self._conn.commit()
+
+    def author_disable_reason(self, author_id: str, kind: str = "novel") -> str:
+        row = self._conn.execute(
+            "SELECT disabled_reason FROM authors WHERE author_id=? AND kind=?",
+            (author_id, kind)).fetchone()
+        return (row[0] or "") if row else ""
 
     def authors_due_for_recheck(self, recheck_days: int, kind: str = None) -> list:
         """被停用且已超过复查间隔的作者；recheck_days<=0 时返回空（即不复查）。"""
@@ -175,8 +204,10 @@ class Database:
         if days <= 0:
             return []
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-        sql = "SELECT * FROM authors WHERE enabled=0 AND disabled_at IS NOT NULL AND disabled_at<=?"
-        params = [cutoff]
+        # 只复查「因账号注销被停用」的作者；手动停用的不自动恢复
+        sql = ("SELECT * FROM authors WHERE enabled=0 AND disabled_at IS NOT NULL"
+               " AND disabled_at<=? AND (disabled_reason IS NULL OR disabled_reason!=?)")
+        params = [cutoff, DISABLE_REASON_MANUAL]
         if kind:
             sql += " AND kind=?"
             params.append(kind)
@@ -259,6 +290,11 @@ class Database:
             "UPDATE novels SET status=?, error_reason=?, last_fetch_at=? WHERE novel_id=?",
             (status, error_reason, self._now(), novel_id),
         )
+        self._conn.commit()
+
+    def remove_novel(self, novel_id: str) -> None:
+        """仅删除索引记录，绝不触碰本地已下载文件。"""
+        self._conn.execute("DELETE FROM novels WHERE novel_id=?", (novel_id,))
         self._conn.commit()
 
     def novels_by_author(self, author_id: str) -> list:
@@ -374,6 +410,11 @@ class Database:
             "UPDATE illusts SET status=?, error_reason=?, last_fetch_at=? WHERE illust_id=?",
             (status, error_reason, self._now(), illust_id),
         )
+        self._conn.commit()
+
+    def remove_illust(self, illust_id: str) -> None:
+        """仅删除索引记录，绝不触碰本地已下载文件。"""
+        self._conn.execute("DELETE FROM illusts WHERE illust_id=?", (illust_id,))
         self._conn.commit()
 
     def illusts_by_author(self, author_id: str) -> list:
