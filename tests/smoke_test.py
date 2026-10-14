@@ -1,7 +1,9 @@
+import json
 import os
 import sys
 import tempfile
 import zipfile
+from datetime import datetime, timedelta
 
 os.environ["PIXIV_DATA_DIR"] = tempfile.mkdtemp(prefix="pns_test_")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -70,7 +72,7 @@ check("同名自身不冲突", paths.resolve_collision(_exist, {"novel_id": "7"}
 # 3. 数据库
 tmp = tempfile.mkdtemp()
 db = Database(path=os.path.join(tmp, "t.db"))
-check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 5)
+check("schema 版本", db._conn.execute("PRAGMA user_version").fetchone()[0] == 6)
 check("新增作者", db.add_author("100", "作者甲") is True)
 check("重复作者拒绝", db.add_author("100") is False)
 check("同 ID 可入插画名单", db.add_author("100", kind="illust") is True)
@@ -371,6 +373,141 @@ check("已删除作品：插画可查询", len(_di) == 1 and _di[0]["illust_id"]
 check("已删除作品：已删除不计入收录数",
       db5.author_novel_count("300") == 0 and db5.author_deleted_novel_count("300") == 1)
 db5.close()
+
+# 12. 作者链接解析
+from app.core.utils import extract_author_id
+check("链接解析：纯数字 ID", extract_author_id("104854837") == "104854837")
+check("链接解析：作者主页 URL",
+      extract_author_id("https://www.pixiv.net/users/104854837") == "104854837")
+check("链接解析：带子路径的 URL",
+      extract_author_id("https://www.pixiv.net/users/104854837/novels") == "104854837")
+check("链接解析：旧版 member.php",
+      extract_author_id("https://www.pixiv.net/member.php?id=104854837") == "104854837")
+check("链接解析：作品链接不给作者 ID",
+      extract_author_id("https://www.pixiv.net/novel/show.php?id=123") == "")
+check("链接解析：非法输入", extract_author_id("abc") == "" and extract_author_id("") == "")
+
+# 13. 已注销作者的处理策略（不触网）
+from app.core.scraper import ScraperEngine
+_db6 = Database(path=os.path.join(tmp, "deact.db"))
+_db6.add_author("7001", "甲", kind="novel")
+_db6.add_author("7002", "乙", kind="novel")
+_eng = ScraperEngine.__new__(ScraperEngine)
+_eng.settings = Settings()
+_eng.db = _db6
+_eng.logger = logging.getLogger("t")
+_eng.report = type("R", (), {"aborted_reason": ""})()
+_eng.settings.author_404_action = "disable"
+_eng._handle_author_missing("7001", {"author_id": "7001", "author_name": "甲"}, "novel")
+check("注销策略 disable：自动停用", _db6.get_author("7001", "novel")["enabled"] == 0)
+_eng.settings.author_404_action = "keep"
+_eng._handle_author_missing("7002", {"author_id": "7002", "author_name": "乙"}, "novel")
+check("注销策略 keep：保持启用", _db6.get_author("7002", "novel")["enabled"] == 1)
+check("停用后 UI 判定为已注销",
+      author_display_name(_db6.get_author("7001", "novel")) == ("甲（已注销）", AUTHOR_STATUS_DELETED))
+_db6.close()
+
+# 14. 区分「手动停用」与「账号已注销」
+from app.core.db import DISABLE_REASON_DEACTIVATED, DISABLE_REASON_MANUAL
+from app.ui.author_status import AUTHOR_STATUS_DISABLED
+_db7 = Database(path=os.path.join(tmp, "reason.db"))
+_db7.add_author("8001", "甲", kind="novel")
+_db7.add_author("8002", "乙", kind="novel")
+_db7.set_author_enabled("8001", False, kind="novel", reason=DISABLE_REASON_MANUAL)
+_db7.set_author_enabled("8002", False, kind="novel", reason=DISABLE_REASON_DEACTIVATED)
+check("手动停用：原因为 manual",
+      _db7.author_disable_reason("8001", "novel") == DISABLE_REASON_MANUAL)
+check("账号注销：原因为 deactivated",
+      _db7.author_disable_reason("8002", "novel") == DISABLE_REASON_DEACTIVATED)
+check("手动停用 → 显示「已停用」",
+      author_display_name(_db7.get_author("8001", "novel")) == ("甲（已停用）", AUTHOR_STATUS_DISABLED))
+check("账号注销 → 显示「已注销」",
+      author_display_name(_db7.get_author("8002", "novel")) == ("乙（已注销）", AUTHOR_STATUS_DELETED))
+check("状态列文案区分", status_text(AUTHOR_STATUS_DISABLED) == "已停用"
+      and status_text(AUTHOR_STATUS_DELETED) == "已注销")
+# 手动停用的不应被自动复查捞回
+_old = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
+_db7._conn.execute("UPDATE authors SET disabled_at=? WHERE author_id IN ('8001','8002')", (_old,))
+_db7._conn.commit()
+_due = [a["author_id"] for a in _db7.authors_due_for_recheck(30, kind="novel")]
+check("自动复查只捞回注销的，不含手动停用的", _due == ["8002"])
+# 重新启用会清空原因
+_db7.set_author_enabled("8001", True, kind="novel")
+check("重新启用清空停用原因", _db7.author_disable_reason("8001", "novel") == "")
+_db7.close()
+
+# 15. 离线重建 MD 索引
+from app.core.scraper import rebuild_md_indexes, refresh_author_md
+_md_root = os.path.join(tmp, "mdrebuild")
+_db8 = Database(path=os.path.join(tmp, "md.db"))
+_db8.add_author("9001", "作者甲", kind="novel")
+_db8.add_author("9001", "作者甲", kind="illust")
+_db8.upsert_novel({"novel_id": "9501", "author_id": "9001", "author_name": "作者甲",
+                   "title": "作品一", "status": "ok", "local_path": "a.epub",
+                   "publish_date": "2026-01-01T10:00:00"})
+_s2 = Settings()
+_s2.epub_root = _md_root
+rep = rebuild_md_indexes(_s2, _db8, logging.getLogger("t"))
+check("重建索引：仅按作者去重统计", rep["authors"] == 1 and rep["written"] == 1)
+_written = [f for f in os.listdir(os.path.join(_md_root, "9001_作者甲")) if f.endswith(".md")]
+check("重建索引：生成了 MD 文件", len(_written) >= 1)
+# 关闭开关后，抓取流程不写、但显式重建仍可写
+_s2.write_md_index = False
+check("重建索引不受 write_md_index 开关影响（显式操作）",
+      refresh_author_md(_s2, _db8, logging.getLogger("t"), "9001") is True)
+_db8.close()
+
+# 16. 检索与队列单条操作
+_db9 = Database(path=os.path.join(tmp, "ops.db"))
+_db9.add_author("9101", "作者庚", kind="novel")
+_db9.upsert_novel({"novel_id": "9601", "author_id": "9101", "author_name": "作者庚",
+                   "title": "关键字小说", "status": "ok", "local_path": "n.epub"})
+_db9.upsert_illust({"illust_id": "9701", "author_id": "9101", "author_name": "作者庚",
+                    "title": "关键字插画", "status": "ok", "local_path": "i.jpg"})
+check("检索：小说可被查到", len(_db9.search_novels("关键字")) == 1)
+check("检索：插画可被查到（此前 UI 未接此接口）", len(_db9.search_illusts("关键字")) == 1)
+_db9.set_novel_status("9601", "deleted")
+check("队列：已删除作品可查询", len(_db9.deleted_novels()) == 1)
+_db9.remove_novel("9601")
+check("队列：移除小说记录后查不到", _db9.get_novel("9601") is None)
+_db9.remove_illust("9701")
+check("队列：移除插画记录后查不到", _db9.get_illust("9701") is None)
+_db9.close()
+
+# 17. 抓取前自动备份（按用户要求：包含 Cookie）
+from app.core.backup import auto_backup_dir, create_auto_backup
+from app.core.scraper import RunReport, ScraperEngine
+_db10 = Database(path=os.path.join(tmp, "ab.db"))
+_db10.add_author("9201", "作者壬", kind="novel")
+_s3 = Settings()
+_ab_dir = auto_backup_dir()
+check("RunReport 默认 auth_expired=False", RunReport().auth_expired is False)
+
+_before = len([f for f in os.listdir(_ab_dir)]) if os.path.isdir(_ab_dir) else 0
+_eng3 = ScraperEngine.__new__(ScraperEngine)
+_eng3.settings = Settings()
+_eng3.settings.auto_backup_enabled = False
+_eng3.db = _db10
+_eng3.cookie = "PHPSESSID=x"
+_eng3.logger = logging.getLogger("t")
+_eng3._auto_backup()
+_after = len([f for f in os.listdir(_ab_dir)]) if os.path.isdir(_ab_dir) else 0
+check("自动备份：关闭时不产生备份", _before == _after)
+
+_p = create_auto_backup(_s3, _db10, "PHPSESSID=auto_backup_test", keep=3)
+check("自动备份：文件已生成", os.path.exists(_p))
+_raw = json.load(open(_p, encoding="utf-8"))
+check("自动备份：包含 Cookie（按用户要求）", _raw.get("cookie") == "PHPSESSID=auto_backup_test")
+check("自动备份：包含作者列表", len(_raw.get("authors", [])) == 1)
+for _n in ("backup_20260101_000000.json", "backup_20260102_000000.json",
+           "backup_20260103_000000.json"):
+    with open(os.path.join(_ab_dir, _n), "w", encoding="utf-8") as _fh:
+        _fh.write("{}")
+create_auto_backup(_s3, _db10, "PHPSESSID=x", keep=3)
+_left = sorted(f for f in os.listdir(_ab_dir)
+               if f.startswith("backup_") and f.endswith(".json"))
+check("自动备份：滚动保留 3 份", len(_left) == 3)
+_db10.close()
 
 print()
 if failures:
