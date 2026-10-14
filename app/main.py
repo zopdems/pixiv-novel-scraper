@@ -64,7 +64,9 @@ def main():
     )
 
     def notify_report(report):
-        if report.aborted_reason:
+        if getattr(report, "auth_expired", False):
+            tray.notify("Cookie 已失效", "请重新导入登录 Cookie，否则定时抓取会持续失败")
+        elif report.aborted_reason:
             tray.notify("抓取任务异常", report.aborted_reason)
         else:
             tray.notify(

@@ -15,7 +15,9 @@ from .. import credentials
 from ..autostart import set_autostart
 from ..config import reset_advanced_settings, save_settings as persist_settings
 from ..core import paths
-from ..core.models import status_label
+from ..core.db import DISABLE_REASON_MANUAL
+from ..core.models import STATUS_LABELS, Status, status_label
+from ..core.utils import extract_author_id
 from ..pixiv.client import PixivClient
 from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
                             AUTHOR_STATUS_DELETED, AUTHOR_STATUS_UNKNOWN,
@@ -24,7 +26,7 @@ from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
                             status_text)
 from .icons import app_mark, icon
 from .theme import apply_theme, current_mode, resolve_mode, tokens
-from .worker import ScrapeWorker
+from .worker import RebuildMdWorker, ScrapeWorker
 
 _AUTHOR_ID_RE = re.compile(r"^\d+$")
 
@@ -81,7 +83,12 @@ class BatchImportDialog(QDialog):
 
     def ids(self) -> list:
         text = self.edit.toPlainText()
-        return [s for s in re.split(r"[\s,，、;；]+", text) if _AUTHOR_ID_RE.match(s)]
+        out = []
+        for s in re.split(r"[\s,，、;；]+", text):
+            aid = extract_author_id(s)
+            if aid:
+                out.append(aid)
+        return out
 
 
 class MainWindow(QMainWindow):
@@ -91,6 +98,8 @@ class MainWindow(QMainWindow):
         self.db = db
         self.logger = logger
         self.worker = None
+        self.md_worker = None
+        self.last_report = None
         self.on_fetch_done = None
         self.on_theme_changed = None
 
@@ -257,7 +266,7 @@ class MainWindow(QMainWindow):
         row.setSpacing(8)
 
         self.author_input = QLineEdit()
-        self.author_input.setPlaceholderText("输入作者数字 ID，回车快速添加")
+        self.author_input.setPlaceholderText("作者数字 ID，或粘贴 pixiv.net/users/… 主页链接")
         self.author_input.returnPressed.connect(self.add_author)
         self.author_input.setFixedWidth(280)
 
@@ -272,6 +281,10 @@ class MainWindow(QMainWindow):
         row.addWidget(btn_batch)
         row.addStretch(1)
 
+        self.btn_rebuild_md = QPushButton("重建索引")
+        self.btn_rebuild_md.setToolTip("按当前设置重新生成全部作者的 Markdown 索引（不联网、不重新下载作品）")
+        self.btn_rebuild_md.clicked.connect(self.rebuild_md_index)
+
         btn_open = QPushButton("打开主页")
         btn_open.clicked.connect(self.open_author_page)
         btn_toggle = QPushButton("启用 / 停用")
@@ -279,6 +292,7 @@ class MainWindow(QMainWindow):
         btn_del = QPushButton("删除")
         btn_del.setProperty("class", "danger")
         btn_del.clicked.connect(self.delete_author)
+        row.addWidget(self.btn_rebuild_md)
         row.addWidget(btn_open)
         row.addWidget(btn_toggle)
         row.addWidget(btn_del)
@@ -294,9 +308,15 @@ class MainWindow(QMainWindow):
         self.author_tabs.addTab(self.novel_author_table, "小说作者")
         self.author_tabs.addTab(self.illust_author_table, "插画作者")
         self.author_tabs.addTab(self._build_deleted_works_tab(), "已删除作品")
+        # 每次切到「已删除作品」都重置为收起，不继承上次的展开状态
+        self.author_tabs.currentChanged.connect(self._on_author_tab_changed)
         tl.addWidget(self.author_tabs, 1)
         outer.addWidget(table_card, 1)
         return page
+
+    def _on_author_tab_changed(self, index: int):
+        if index == 2:
+            self.deleted_tree.collapseAll()
 
     def _build_deleted_works_tab(self) -> QWidget:
         """「已删除作品」标签页：按作者分组列出远端已删除的作品。"""
@@ -357,9 +377,12 @@ class MainWindow(QMainWindow):
         webbrowser.open(f"https://www.pixiv.net/users/{aid}")
 
     def add_author(self):
-        text = self.author_input.text().strip()
-        if not _AUTHOR_ID_RE.match(text):
-            QMessageBox.warning(self, "输入无效", "作者 ID 应为纯数字")
+        aid = extract_author_id(self.author_input.text())
+        if not aid:
+            QMessageBox.warning(
+                self, "输入无效",
+                "请填写作者数字 ID，或直接粘贴作者主页链接，例如：\n"
+                "https://www.pixiv.net/users/104854837")
             return
         kind = self._active_author_kind()
         if kind is None:
@@ -408,7 +431,9 @@ class MainWindow(QMainWindow):
         kind = self._active_author_kind()
         cur = self.db.get_author(aid, kind=kind)
         if cur:
-            self.db.set_author_enabled(aid, not cur["enabled"], kind=kind)
+            # 停用一律记为「手动」，与抓取时判定的「账号已注销」区分开
+            self.db.set_author_enabled(aid, not cur["enabled"], kind=kind,
+                                       reason=DISABLE_REASON_MANUAL)
             self.refresh_authors()
 
     def delete_author(self):
@@ -458,6 +483,38 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(True)
 
     # ------------------------------------------------ 已删除作品
+    # ------------------------------------------------ 重建 Markdown 索引
+    def rebuild_md_index(self):
+        if not (self.settings.epub_root or "").strip():
+            QMessageBox.warning(self, "提示", "请先在「设置 → 存储路径」里设置保存目录，再重建索引。")
+            return
+        extra = ""
+        if not getattr(self.settings, "write_md_index", True):
+            extra = ("\n\n注意：当前已关闭「生成作者索引 MD」，重建出的文件在后续抓取中不会再被更新，"
+                     "如需持续维护请先在设置里开启。")
+        answer = QMessageBox.question(
+            self, "重建索引",
+            f"将为全部作者重新生成 Markdown 索引：不联网、不重新下载作品，"
+            f"只根据本地已有的作品信息重写。{extra}\n\n是否继续？")
+        if answer != QMessageBox.Yes:
+            return
+        self.btn_rebuild_md.setEnabled(False)
+        self.btn_rebuild_md.setText("重建中…")
+        self.md_worker = RebuildMdWorker(self.settings, self.db, self.logger)
+        self.md_worker.finished_report.connect(self._on_rebuild_md_done)
+        self.md_worker.start()
+
+    def _on_rebuild_md_done(self, report: dict):
+        self.btn_rebuild_md.setEnabled(True)
+        self.btn_rebuild_md.setText("重建索引")
+        if report.get("error"):
+            QMessageBox.warning(self, "重建索引", f"重建失败：{report['error']}")
+            return
+        QMessageBox.information(
+            self, "重建索引",
+            f"已处理 {report.get('authors', 0)} 位作者："
+            f"写入 {report.get('written', 0)} 个，失败 {report.get('failed', 0)} 个。")
+
     def _fill_deleted_tree(self):
         tree = self.deleted_tree
         tk = tokens(current_mode())
@@ -533,7 +590,8 @@ class MainWindow(QMainWindow):
                 group.addChild(node)
             tree.addTopLevelItem(group)
 
-        tree.expandAll()
+        # 默认全部收起：只有用户主动点击分组才会展开
+        tree.collapseAll()
         total_works = sum(len(v) for v in data.values())
         if not data:
             self.deleted_summary.setText(
@@ -612,6 +670,11 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(btn_logs)
         bl.addLayout(row)
+
+        self.last_run_label = QLabel("尚未执行过抓取")
+        self.last_run_label.setProperty("class", "hint")
+        self.last_run_label.setWordWrap(True)
+        bl.addWidget(self.last_run_label)
         outer.addWidget(bar)
 
         log_card, lc = self._card(margin=12, spacing=8)
@@ -643,6 +706,16 @@ class MainWindow(QMainWindow):
         fhead.addWidget(ft)
         fhead.addWidget(self.failed_count)
         fhead.addStretch(1)
+        btn_retry_one = QPushButton("重新抓取")
+        btn_retry_one.setProperty("class", "ghost")
+        btn_retry_one.setToolTip("把选中项重置为「待下载」，下一轮抓取会重新尝试")
+        btn_retry_one.clicked.connect(self.retry_selected_item)
+        btn_drop_one = QPushButton("移除记录")
+        btn_drop_one.setProperty("class", "ghost")
+        btn_drop_one.setToolTip("仅从本列表移除索引记录，本地已下载的文件不会被删除")
+        btn_drop_one.clicked.connect(self.remove_selected_item)
+        fhead.addWidget(btn_retry_one)
+        fhead.addWidget(btn_drop_one)
         fc.addLayout(fhead)
 
         self.failed_table = QTableWidget(0, 4)
@@ -741,34 +814,110 @@ class MainWindow(QMainWindow):
         if report.aborted_reason:
             summary += f"\n{report.aborted_reason}"
         self.progress_view.appendPlainText(summary)
+        self.last_report = report
+        self._update_last_run_label()
         self.refresh_authors()
         self.refresh_failed()
+        if getattr(report, "auth_expired", False):
+            # 登录失效：切换连接徽标为警告态，并明确提示需要重新导入 Cookie
+            _set_class(self.conn_badge, "badge-warn")
+            self.conn_badge.setText("Cookie 已失效")
         if self.on_fetch_done:
             self.on_fetch_done(report)
 
+    def _update_last_run_label(self):
+        """在任务页保留上一次抓取的结果摘要，切走再回来也能看到。"""
+        report = getattr(self, "last_report", None)
+        if report is None:
+            self.last_run_label.setText("尚未执行过抓取")
+            return
+        when = (getattr(report, "finished_at", "") or getattr(report, "started_at", "") or "")[:16]
+        if getattr(report, "auth_expired", False):
+            self.last_run_label.setText(f"上次任务 {when}：登录已失效，任务中止，请重新导入 Cookie")
+            _set_class(self.last_run_label, "status-err")
+            return
+        if getattr(report, "aborted_reason", ""):
+            self.last_run_label.setText(f"上次任务 {when}：已中止 — {report.aborted_reason}")
+            _set_class(self.last_run_label, "status-err")
+            return
+        failed = getattr(report, "failed_count", 0) + getattr(report, "illust_failed", 0)
+        text = (f"上次任务 {when}：新增 {report.new_count} / 更新 {report.updated_count} / "
+                f"跳过 {report.skipped_count} / 失败 {failed} / 远端删除 {report.deleted_count}")
+        _set_class(self.last_run_label, "status-err" if failed else "status-ok")
+        self.last_run_label.setText(text)
+
     def refresh_failed(self):
         rows = [
-            (n["novel_id"], n.get("title") or "-", n.get("error_reason") or "-", status_label(n["status"]))
+            ("novel", n["novel_id"], n.get("title") or "-",
+             n.get("error_reason") or "-", status_label(n["status"]))
             for n in self.db.failed_novels()
         ]
         rows += [
-            (i["illust_id"], "[图] " + (i.get("title") or "-"), i.get("error_reason") or "-", status_label(i["status"]))
+            ("illust", i["illust_id"], "[图] " + (i.get("title") or "-"),
+             i.get("error_reason") or "-", status_label(i["status"]))
             for i in self.db.failed_illusts()
         ]
         rows += [
-            (n["novel_id"], n.get("title") or "-", "远端已删除（本地文件保留）", status_label(n["status"]))
+            ("novel", n["novel_id"], n.get("title") or "-",
+             "远端已删除（本地文件保留）", status_label(n["status"]))
             for n in self.db.deleted_novels()
         ]
         rows += [
-            (i["illust_id"], "[图] " + (i.get("title") or "-"), "远端已删除（本地文件保留）", status_label(i["status"]))
+            ("illust", i["illust_id"], "[图] " + (i.get("title") or "-"),
+             "远端已删除（本地文件保留）", status_label(i["status"]))
             for i in self.db.deleted_illusts()
         ]
         self.failed_table.setSortingEnabled(False)
         self.failed_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            for c, text in enumerate(row):
-                self.failed_table.setItem(i, c, QTableWidgetItem(str(text)))
+            kind = row[0]
+            for c, text in enumerate(row[1:]):
+                item = QTableWidgetItem(str(text))
+                if c == 0:
+                    item.setData(Qt.UserRole, kind)  # 记录是小说还是插画
+                self.failed_table.setItem(i, c, item)
+        self.failed_table.setSortingEnabled(True)
         self.failed_count.setText(f"共 {len(rows)} 条" if rows else "暂无记录")
+
+    def _selected_failed_item(self):
+        """返回 (kind, work_id)；未选中时返回 (None, None)。"""
+        row = self.failed_table.currentRow()
+        if row < 0:
+            return None, None
+        id_item = self.failed_table.item(row, 0)
+        if id_item is None:
+            return None, None
+        return id_item.data(Qt.UserRole), id_item.text().strip()
+
+    def retry_selected_item(self):
+        kind, work_id = self._selected_failed_item()
+        if not work_id:
+            QMessageBox.information(self, "提示", "请先在下方列表里选中一条记录。")
+            return
+        if kind == "illust":
+            self.db.set_illust_status(work_id, Status.PENDING)
+        else:
+            self.db.set_novel_status(work_id, Status.PENDING)
+        self.logger.info("已将 %s 重置为待下载，下一轮抓取会重新尝试", work_id)
+        self.refresh_failed()
+
+    def remove_selected_item(self):
+        kind, work_id = self._selected_failed_item()
+        if not work_id:
+            QMessageBox.information(self, "提示", "请先在下方列表里选中一条记录。")
+            return
+        answer = QMessageBox.question(
+            self, "移除记录",
+            f"将从列表移除作品 {work_id} 的索引记录。\n\n"
+            "本地已下载的文件不会被删除，但重新抓取时该作品会被当作新作品处理。\n\n是否继续？")
+        if answer != QMessageBox.Yes:
+            return
+        if kind == "illust":
+            self.db.remove_illust(work_id)
+        else:
+            self.db.remove_novel(work_id)
+        self.logger.info("已移除作品 %s 的索引记录（本地文件保留）", work_id)
+        self.refresh_failed()
 
     # ================================================================ 检索
     def _build_search_page(self):
@@ -786,6 +935,20 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(self.do_search)
         row.addWidget(self.search_input, 1)
         row.addWidget(btn)
+
+        self.search_type = QComboBox()
+        self.search_type.addItem("全部类型", "")
+        self.search_type.addItem("小说", "novel")
+        self.search_type.addItem("插画 / 漫画", "illust")
+        self.search_type.currentIndexChanged.connect(self.do_search)
+        row.addWidget(self.search_type)
+
+        self.search_status = QComboBox()
+        self.search_status.addItem("全部状态", "")
+        for value, label in STATUS_LABELS.items():
+            self.search_status.addItem(label, value)
+        self.search_status.currentIndexChanged.connect(self.do_search)
+        row.addWidget(self.search_status)
         bl.addLayout(row)
         outer.addWidget(bar)
 
@@ -804,12 +967,13 @@ class MainWindow(QMainWindow):
         rhead.addWidget(btn_refresh)
         rc.addLayout(rhead)
 
-        self.search_table = QTableWidget(0, 4)
-        self.search_table.setHorizontalHeaderLabels(["标题", "作者", "状态", "本地路径"])
+        self.search_table = QTableWidget(0, 5)
+        self.search_table.setHorizontalHeaderLabels(["标题", "类型", "作者", "状态", "本地路径"])
         self.search_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.search_table.setColumnWidth(1, 150)
-        self.search_table.setColumnWidth(2, 90)
-        self.search_table.setColumnWidth(3, 280)
+        self.search_table.setColumnWidth(1, 110)
+        self.search_table.setColumnWidth(2, 150)
+        self.search_table.setColumnWidth(3, 90)
+        self.search_table.setColumnWidth(4, 280)
         self.search_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.search_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.search_table.setAlternatingRowColors(True)
@@ -829,22 +993,36 @@ class MainWindow(QMainWindow):
         kw = self.search_input.text().strip()
         if not kw:
             return
-        results = self.db.search_novels(kw)
-        self.search_table.setRowCount(len(results))
-        for i, n in enumerate(results):
+        kind_filter = (self.search_type.currentData() or "") if self.search_type else ""
+        status_filter = (self.search_status.currentData() or "") if self.search_status else ""
+
+        rows = []
+        if kind_filter in ("", "novel"):
+            rows += [("novel", n) for n in self.db.search_novels(kw)]
+        if kind_filter in ("", "illust"):
+            rows += [("illust", i) for i in self.db.search_illusts(kw)]
+        if status_filter:
+            rows = [r for r in rows if r[1].get("status") == status_filter]
+
+        self.search_table.setRowCount(len(rows))
+        for i, (ktype, rec) in enumerate(rows):
             for c, text in enumerate([
-                n.get("title") or "-", n.get("author_name") or "-",
-                status_label(n["status"]), n.get("local_path") or "-",
+                rec.get("title") or "-",
+                "小说" if ktype == "novel" else "插画 / 漫画",
+                rec.get("author_name") or "-",
+                status_label(rec["status"]),
+                rec.get("local_path") or "-",
             ]):
                 self.search_table.setItem(i, c, QTableWidgetItem(str(text)))
-        self.search_count.setText(f"共 {len(results)} 条")
+        self.search_count.setText(f"共 {len(rows)} 条")
 
     def open_novel_dir(self):
         row = self.search_table.currentRow()
         if row < 0:
             return
-        path = self.search_table.item(row, 3).text()
-        if path and os.path.exists(path):
+        item = self.search_table.item(row, 4)  # 本地路径列
+        path = item.text() if item else ""
+        if path and path != "-" and os.path.exists(path):
             os.startfile(os.path.dirname(path))
 
     # ================================================================ 设置
@@ -1019,7 +1197,8 @@ class MainWindow(QMainWindow):
             ("本轮跳过，不改状态", "skip"),
         ], getattr(s, "author_404_action", "disable"))
         form.addRow("作者账号 404 时", self.set_404)
-        hint(form, "仅当「拉取作者作品清单」返回 404 时触发；单部作品 404 不受此项影响。")
+        hint(form, "判定依据是账号主体接口（已注销账号的作品列表接口仍返回 200 空列表，不可靠）；"
+                   "单部作品被删除不受此项影响。")
 
         self.set_recheck = QSpinBox()
         self.set_recheck.setRange(0, 365)
@@ -1266,6 +1445,19 @@ class MainWindow(QMainWindow):
         backup_row.addStretch(1)
         form.addRow("配置迁移", backup_row)
 
+        section(form, "自动备份")
+        self.set_auto_backup = QCheckBox("每轮抓取前自动备份")
+        self.set_auto_backup.setChecked(bool(getattr(s, "auto_backup_enabled", True)))
+        form.addRow("", self.set_auto_backup)
+
+        self.set_backup_keep = QSpinBox()
+        self.set_backup_keep.setRange(1, 50)
+        self.set_backup_keep.setSuffix(" 份")
+        self.set_backup_keep.setValue(int(getattr(s, "auto_backup_keep", 5) or 5))
+        form.addRow("保留份数", self.set_backup_keep)
+        hint(form, "备份保存在数据目录下的 backups 文件夹，"
+                   "内容与手动导出一致、明文包含 Cookie，请勿外传或上传；超出份数的旧备份会自动删除。")
+
         self.settings_nav.setCurrentRow(0)
         return page
 
@@ -1400,6 +1592,8 @@ class MainWindow(QMainWindow):
         s.series_recheck_days = int(self.set_series_recheck.value())
         s.remote_deleted_action = self.set_del_action.currentData() or "keep"
         s.author_rename_migrate = self.set_rename_mig.isChecked()
+        s.auto_backup_enabled = self.set_auto_backup.isChecked()
+        s.auto_backup_keep = int(self.set_backup_keep.value())
         return s
 
     def _sync_advanced_controls(self):
@@ -1442,6 +1636,8 @@ class MainWindow(QMainWindow):
         self.set_series_recheck.setValue(int(getattr(s, "series_recheck_days", 30) or 30))
         _set_combo(self.set_del_action, getattr(s, "remote_deleted_action", "keep"))
         self.set_rename_mig.setChecked(bool(getattr(s, "author_rename_migrate", True)))
+        self.set_auto_backup.setChecked(bool(getattr(s, "auto_backup_enabled", True)))
+        self.set_backup_keep.setValue(int(getattr(s, "auto_backup_keep", 5) or 5))
 
     def reset_advanced(self):
         answer = QMessageBox.question(

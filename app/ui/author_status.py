@@ -9,19 +9,24 @@
 """
 from PySide6.QtGui import QColor
 
+from ..core.db import DISABLE_REASON_MANUAL
+
 # ---- 状态常量 ----
 AUTHOR_STATUS_ACTIVE = "active"      # 正常
-AUTHOR_STATUS_DELETED = "deleted"    # 已注销（含记录被停用 / 数据缺失）
+AUTHOR_STATUS_DELETED = "deleted"    # 已注销（账号已离开 pixiv / 不存在）
+AUTHOR_STATUS_DISABLED = "disabled"  # 已停用（用户手动关闭，账号本身正常）
 AUTHOR_STATUS_PENDING = "pending"    # 待校验（刚按 ID 添加，尚未拉到昵称）
 AUTHOR_STATUS_UNKNOWN = "unknown"    # 信息加载失败 / 读取异常
 
 # ---- 统一文案 ----
 AUTHOR_DELETED_LABEL = "已注销"
+AUTHOR_DISABLED_LABEL = "已停用"
 AUTHOR_PENDING_LABEL = "待校验"
 AUTHOR_UNKNOWN_LABEL = "信息加载失败"
 
 _STATUS_TEXT = {
     AUTHOR_STATUS_DELETED: AUTHOR_DELETED_LABEL,
+    AUTHOR_STATUS_DISABLED: AUTHOR_DISABLED_LABEL,
     AUTHOR_STATUS_PENDING: AUTHOR_PENDING_LABEL,
     AUTHOR_STATUS_UNKNOWN: AUTHOR_UNKNOWN_LABEL,
 }
@@ -30,6 +35,7 @@ _STATUS_TEXT = {
 STATUS_TOKEN = {
     AUTHOR_STATUS_ACTIVE: "success",
     AUTHOR_STATUS_DELETED: "text_muted",
+    AUTHOR_STATUS_DISABLED: "warn",
     AUTHOR_STATUS_PENDING: "warn",
     AUTHOR_STATUS_UNKNOWN: "danger",
 }
@@ -65,6 +71,10 @@ def resolve_author_status(row) -> str:
         if not aid:
             return AUTHOR_STATUS_DELETED
         if not int(_get(row, "enabled", 1) or 0):
+            # 区分「手动停用」与「账号已注销」；历史数据无原因时按注销处理（保持旧行为）
+            reason = str(_get(row, "disabled_reason") or "").strip().lower()
+            if reason == DISABLE_REASON_MANUAL:
+                return AUTHOR_STATUS_DISABLED
             return AUTHOR_STATUS_DELETED
         name = str(_get(row, "author_name") or "").strip()
         if not name:
@@ -79,9 +89,10 @@ def resolve_author_status(row) -> str:
 def author_display_name(row) -> tuple:
     """返回 (显示名, 状态)。保证返回值永远非空。"""
     status = resolve_author_status(row)
-    if status == AUTHOR_STATUS_DELETED:
+    if status in (AUTHOR_STATUS_DELETED, AUTHOR_STATUS_DISABLED):
         raw = str(_get(row, "author_name") or "").strip()
-        return (f"{raw}（{AUTHOR_DELETED_LABEL}）" if raw else AUTHOR_DELETED_LABEL, status)
+        label = AUTHOR_DELETED_LABEL if status == AUTHOR_STATUS_DELETED else AUTHOR_DISABLED_LABEL
+        return (f"{raw}（{label}）" if raw else label, status)
     if status in _STATUS_TEXT:
         return (_STATUS_TEXT[status], status)
     name = str(_get(row, "author_name") or "").strip()
@@ -116,6 +127,8 @@ def decorate_name_item(item, status: str, accent_color: str, muted_color: str):
             item.setFont(font)
             if status == AUTHOR_STATUS_DELETED:
                 item.setToolTip("该账号已注销；双击仍可打开其 Pixiv 主页（页面为空属预期）")
+            elif status == AUTHOR_STATUS_DISABLED:
+                item.setToolTip("你手动停用了该作者，账号本身正常；双击可打开其 Pixiv 主页")
             elif status == AUTHOR_STATUS_PENDING:
                 item.setToolTip("已加入名单，待下次抓取时补全昵称")
             else:
