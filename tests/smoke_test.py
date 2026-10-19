@@ -509,6 +509,352 @@ _left = sorted(f for f in os.listdir(_ab_dir)
 check("自动备份：滚动保留 3 份", len(_left) == 3)
 _db10.close()
 
+# 18. 排行榜：归一化与数据层
+from app.core.rank_db import RankDatabase, default_modes, mode_label
+from app.core.ranking import (RankingService, _norm_date, _parse_api_date, fetch_ranking,
+                             filter_language, normalize)
+check("排行榜：默认榜单", default_modes() == ["daily", "weekly"])
+check("排行榜：榜单名本地化", mode_label("daily") == "每日" and mode_label("daily_r18") == "每日 R-18")
+_n = normalize({"id": "123", "rank": 5, "title": "标题", "user_id": "9", "user_name": "作者",
+                "word_count": "100", "bookmark_count": "50", "tag_a": ["a", "b"],
+                "x_restrict": "0", "url": "http://x"})
+check("排行榜：条目归一化",
+      _n["work_id"] == "123" and _n["rank"] == 5 and _n["author_id"] == "9"
+      and _n["tags"] == ["a", "b"] and _n["word_count"] == 100)
+check("排行榜：日期归一化",
+      _norm_date("20261017") == "2026-10-17" and _norm_date("2026-10-17") == "2026-10-17")
+# 接口会返回「2026年9月1日」这种月/日不带前导零的格式，直接抽数字只有 6 位会错判成今天
+check("排行榜：接口日期（月日为一位数）",
+      _parse_api_date("2026年9月1日") == "2026-09-01")
+check("排行榜：接口日期（两位数）",
+      _parse_api_date("2026年10月17日") == "2026-10-17")
+check("排行榜：接口日期（纯数字）", _parse_api_date("20260901") == "2026-09-01")
+check("排行榜：接口日期无法识别时返回空", _parse_api_date("") == "" and _parse_api_date(None) == "")
+
+_rdb = RankDatabase(os.path.join(tmp, "rank.db"), logging.getLogger("t"))
+_d1 = [
+    {"work_id": "80001", "rank": 1, "title": "甲作", "author_id": "9001",
+     "author_name": "甲", "bookmark_count": 100, "tags": ["t1"]},
+    {"work_id": "80002", "rank": 2, "title": "乙作", "author_id": "9002",
+     "author_name": "乙", "bookmark_count": 200, "tags": []},
+]
+_rdb.save_snapshot("daily", "2026-10-01", _d1)
+check("排行榜：快照写入", _rdb.latest_date("daily") == "2026-10-01")
+_e1 = _rdb.entries("daily", "2026-10-01")
+check("排行榜：首次上榜标记", len(_e1) == 2 and _e1[0]["is_new"] is True)
+
+_d2 = [
+    {"work_id": "80001", "rank": 1, "title": "甲作", "author_id": "9001",
+     "author_name": "甲", "bookmark_count": 150, "tags": ["t1"]},
+    {"work_id": "80002", "rank": 3, "title": "乙作", "author_id": "9002",
+     "author_name": "乙", "bookmark_count": 200, "tags": []},
+    {"work_id": "80003", "rank": 2, "title": "丙作", "author_id": "9003",
+     "author_name": "丙", "bookmark_count": 10, "tags": []},
+]
+_rdb.save_snapshot("daily", "2026-10-02", _d2)
+_e2 = {x["work_id"]: x for x in _rdb.entries("daily", "2026-10-02")}
+check("排行榜：在榜天数", _e2["80001"]["days_on_board"] == 2 and _e2["80003"]["days_on_board"] == 1)
+check("排行榜：名次变化（正数=上升）", _e2["80001"]["rank_delta"] == 0)
+check("排行榜：名次变化（负数=下降）", _e2["80002"]["rank_delta"] == -1)
+check("排行榜：收藏日增", _e2["80001"]["bookmark_delta"] == 50)
+check("排行榜：新作品无变化值", _e2["80003"]["is_new"] is True)
+check("排行榜：同日重复保存为覆盖",
+      _rdb.save_snapshot("daily", "2026-10-02", _d2) == 3
+      and len(_rdb.entries("daily", "2026-10-02")) == 3)
+check("排行榜：多榜并存", _rdb.save_snapshot("weekly", "2026-10-02", _d2) == 3
+      and len(_rdb.dates("weekly")) == 1)
+check("排行榜：作品历史（单一榜单）", len(_rdb.work_history("80001", mode="daily")) == 2)
+check("排行榜：作品历史（跨榜单）", len(_rdb.work_history("80001")) == 3)
+check("排行榜：快照统计", _rdb.snapshot_stats()["daily"]["snapshots"] == 2)
+check("排行榜：清理旧快照",
+      _rdb.prune_before("2026-10-02") >= 1 and _rdb.latest_date("daily") == "2026-10-02")
+_rdb.close()
+
+# 19. 排行榜：正文下载去重判定（霸榜不重复下载）
+_db11 = Database(path=os.path.join(tmp, "rankdl.db"))
+_svc = RankingService.__new__(RankingService)
+_svc.db = _db11
+check("排行榜：未收录的作品需下载", _svc._need_download("77001") is True)
+_ok_file = os.path.join(tmp, "exists.epub")
+with open(_ok_file, "w", encoding="utf-8") as _fh:
+    _fh.write("x")
+_db11.upsert_novel({"novel_id": "77002", "author_id": "1", "author_name": "甲",
+                    "title": "T", "status": "ok", "local_path": _ok_file})
+check("排行榜：已下载且文件在 → 不重复下载", _svc._need_download("77002") is False)
+_db11.upsert_novel({"novel_id": "77003", "author_id": "1", "author_name": "甲",
+                    "title": "T", "status": "ok", "local_path": os.path.join(tmp, "gone.epub")})
+check("排行榜：本地文件缺失 → 重新下载", _svc._need_download("77003") is True)
+_db11.close()
+
+# 20. 排行榜导出（让 rank.db 里的数据能被直接查看）
+from app.core.rank_db import _fmt_delta
+_rdb2 = RankDatabase(os.path.join(tmp, "rank2.db"), logging.getLogger("t"))
+_rdb2.save_snapshot("daily", "2026-10-01", _d1)
+_rdb2.save_snapshot("daily", "2026-10-02", _d2)
+_csv = os.path.join(tmp, "rank.csv")
+_csv_h = os.path.join(tmp, "hist.csv")
+_js = os.path.join(tmp, "rank.json")
+check("排行榜：导出 CSV 条数", _rdb2.export_csv("daily", "2026-10-02", _csv) == 3)
+with open(_csv, "rb") as _fh:
+    _bom = _fh.read(3)
+with open(_csv, encoding="utf-8-sig") as _fh:
+    _text = _fh.read()
+check("排行榜：CSV 带 BOM 与表头（Excel 不乱码）",
+      _bom == b"\xef\xbb\xbf" and _text.startswith("名次") and "作品链接" in _text)
+check("排行榜：CSV 含作品链接",
+      "https://www.pixiv.net/novel/show.php?id=80001" in _text)
+check("排行榜：导出 JSON", _rdb2.export_json("daily", "2026-10-02", _js) == 3)
+with open(_js, encoding="utf-8") as _fh:
+    _raw = json.load(_fh)
+check("排行榜：JSON 内容", _raw["count"] == 3 and _raw["items"][0]["work_id"] == "80001")
+check("排行榜：导出作品轨迹", _rdb2.export_work_history_csv("80001", _csv_h) == 2)
+with open(_csv_h, encoding="utf-8-sig") as _fh:
+    check("排行榜：轨迹含作品 ID", "80001" in _fh.read())
+check("排行榜：变化量格式化",
+      _fmt_delta(3) == "+3" and _fmt_delta(-2) == "-2" and _fmt_delta(None) == "")
+_rdb2.close()
+
+# 21. 语言过滤、非字典条目容错、自动 CSV
+from app.core.ranking import RankingService, fetch_ranking, filter_language
+from app.core.rank_db import SRC_BACKFILL
+_mix = [
+    {"work_id": "1", "rank": 1, "title": "中文作", "language": "zh-cn", "bookmark_count": 10},
+    {"work_id": "2", "rank": 2, "title": "日文作", "language": "ja", "bookmark_count": 20},
+    {"work_id": "3", "rank": 3, "title": "其他语言", "language": "other", "bookmark_count": 30},
+]
+check("排行榜：只保留简体中文",
+      [x["work_id"] for x in filter_language(_mix, "zh-cn")] == ["1"])
+check("排行榜：关闭过滤时全保留", len(filter_language(_mix, "")) == 3)
+check("排行榜：语言归一化大小写", normalize({"id": "5", "language": "zh-CN"})["language"] == "zh-cn")
+
+
+class _StubClient:
+    """模拟接口：第 1 页混入字符串遮蔽条目。"""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.n = 0
+
+    def get_json(self, url):
+        i = self.n
+        self.n += 1
+        return {"body": {"date": "20261017",
+                         "display_a": {"rank_a": self.pages[min(i, len(self.pages) - 1)]}}}
+
+
+_got, _gd = fetch_ranking(
+    _StubClient([[{"id": "1", "rank": 1}, "被遮蔽的字符串", {"id": "2", "rank": 2}]]),
+    "daily", logging.getLogger("t"))
+check("排行榜：跳过非字典条目（防崩溃）", len(_got) == 2 and _gd == "2026-10-17")
+
+_rdb3 = RankDatabase(os.path.join(tmp, "rank3.db"), logging.getLogger("t"))
+_rdb3.save_snapshot("daily", "2026-10-05", _d1)
+_svc3 = RankingService.__new__(RankingService)
+_svc3.settings = Settings()
+_svc3.settings.ranking_csv_enabled = True
+_svc3.settings.ranking_csv_dir = os.path.join(tmp, "csvout")
+_svc3.rank_db = _rdb3
+_svc3.logger = logging.getLogger("t")
+_p = _svc3._write_csv("daily", "2026-10-05")
+check("排行榜：自动生成 CSV",
+      bool(_p) and os.path.exists(_p) and "排行榜_daily_2026-10-05.csv" in _p)
+check("排行榜：CSV 含语言列", "语言" in open(_p, encoding="utf-8-sig").read())
+_svc3.settings.ranking_csv_enabled = False
+check("排行榜：关闭后不生成 CSV", _svc3._write_csv("daily", "2026-10-05") == "")
+_rdb3.close()
+
+# 22. 榜单作者汇总（哪些还没加入名单）
+_rdb4 = RankDatabase(os.path.join(tmp, "rank4.db"), logging.getLogger("t"))
+_rdb4.save_snapshot("daily", "2026-10-01", [
+    {"work_id": "1", "rank": 1, "title": "a", "author_id": "11",
+     "author_name": "甲", "bookmark_count": 5, "tags": []},
+    {"work_id": "2", "rank": 2, "title": "b", "author_id": "11",
+     "author_name": "甲", "bookmark_count": 5, "tags": []},
+    {"work_id": "3", "rank": 3, "title": "c", "author_id": "22",
+     "author_name": "乙", "bookmark_count": 5, "tags": []},
+])
+_rdb4.save_snapshot("daily", "2026-10-02", [
+    {"work_id": "1", "rank": 5, "title": "a", "author_id": "11",
+     "author_name": "甲", "bookmark_count": 5, "tags": []},
+])
+_au = {a["author_id"]: a for a in _rdb4.authors()}
+check("榜单作者：按作者聚合去重", len(_au) == 2)
+check("榜单作者：作品数与上榜次数",
+      _au["11"]["works"] == 2 and _au["11"]["entries"] == 3)
+check("榜单作者：最高名次", _au["11"]["best_rank"] == 1)
+check("榜单作者：最近上榜日期", _au["11"]["last_date"] == "2026-10-02")
+_rdb4.close()
+
+# 23. 批量补抓历史（用桩客户端，不联网）
+import re as _re
+import threading as _threading
+
+
+class _DateStubClient:
+    """按 URL 里的 date 返回对应日期的榜单（月/日故意不带前导零，贴近真实接口）。"""
+
+    def __init__(self):
+        self.seen = []
+
+    def get_json(self, url):
+        m = _re.search(r"date=(\d{8})", url)
+        d = m.group(1) if m else "20261017"
+        self.seen.append(d)
+        return {"body": {
+            "date": f"{d[0:4]}年{int(d[4:6])}月{int(d[6:8])}日",
+            "display_a": {"rank_a": [
+                {"id": f"{d}-{i}", "rank": i + 1, "title": f"作品{i}",
+                 "language": "zh-cn", "author_id": "1", "author_name": "甲"}
+                for i in range(2)]}}}
+
+    def close(self):
+        pass
+
+
+_s4 = Settings()
+_s4.ranking_language_filter = False
+_s4.ranking_csv_enabled = False
+_db12 = Database(path=os.path.join(tmp, "bf.db"))
+_rdb5 = RankDatabase(os.path.join(tmp, "rank5.db"), logging.getLogger("t"))
+_svc5 = RankingService.__new__(RankingService)
+_svc5.settings = _s4
+_svc5.db = _db12
+_svc5.rank_db = _rdb5
+_svc5.logger = logging.getLogger("t")
+_svc5.cookie = ""
+_svc5._stop = _threading.Event()
+_svc5.progress_cb = lambda e: None
+_svc5.client = _DateStubClient()
+_rep = _svc5.backfill(["daily"], 3, download=False, source=SRC_BACKFILL)
+check("补抓：逐天执行 3 天", len(_rep["days"]) == 3 and _rep["days_ok"] == 3)
+check("补抓：累计条数", _rep["collected"] == 6)
+check("补抓：入库 3 个不同日期", len(_rdb5.dates("daily")) == 3)
+check("补抓：日期为最近 3 天（含今天）",
+      _rdb5.dates("daily")[0] == datetime.now().strftime("%Y-%m-%d"))
+check("补抓：请求按天去重", len(set(_svc5.client.seen)) == 3)
+_bf_runs = _rdb5.runs()
+check("补抓：写入 1 条抓取历史", len(_bf_runs) == 1)
+check("补抓：历史记录天数与有数据天数",
+      _bf_runs[0]["days"] == 3 and _bf_runs[0]["days_ok"] == 3)
+check("补抓：历史记录来源", _bf_runs[0]["source"] == SRC_BACKFILL)
+check("补抓：历史记录收录条数", _bf_runs[0]["collected"] == 6)
+check("补抓：历史记录起始日期早于结束日期",
+      bool(_bf_runs[0]["date_from"]) and
+      _bf_runs[0]["date_from"] < _bf_runs[0]["rank_date"])
+from app.logging_setup import log_dir as _log_dir
+_txt0 = os.path.join(_log_dir(), RankDatabase.RUN_TXT_NAME)
+check("补抓：同时生成人话 TXT 日志", os.path.exists(_txt0))
+check("补抓：TXT 里带来源与条数",
+      SRC_BACKFILL in open(_txt0, encoding="utf-8").read())
+_db12.close()
+_rdb5.close()
+
+# 24. 空榜单要给出可区分的提示（当天未公布 / 条目被遮蔽）
+class _EmptyStubClient:
+    """返回空榜单，模拟未登录遮蔽或当天未公布。"""
+
+    def get_json(self, url):
+        return {"body": {"date": "", "display_a": {"rank_a": []}}}
+
+    def close(self):
+        pass
+
+
+def _run_empty(date_str):
+    s = Settings()
+    s.ranking_language_filter = False
+    s.ranking_csv_enabled = False
+    svc = RankingService.__new__(RankingService)
+    svc.settings = s
+    svc.db = Database(path=os.path.join(tmp, "empty.db"))
+    svc.rank_db = RankDatabase(os.path.join(tmp, f"rank_empty_{date_str}.db"),
+                               logging.getLogger("t"))
+    svc.logger = logging.getLogger("t")
+    svc.cookie = ""
+    svc._stop = _threading.Event()
+    svc.progress_cb = lambda e: None
+    svc.client = _EmptyStubClient()
+    try:
+        return svc._run_once(["daily"], download=False, date=date_str)
+    finally:
+        svc.db.close()
+        svc.rank_db.close()
+
+
+_today_stamp = datetime.now().strftime("%Y%m%d")
+_r_today = _run_empty(_today_stamp)
+check("空榜单：不崩溃且未收录", _r_today["collected"] == 0)
+check("空榜单：当天提示「尚未公布」",
+      any("尚未公布" in e for e in _r_today["errors"]))
+_r_past = _run_empty("20260101")
+check("空榜单：历史日期提示「被遮蔽」",
+      any("被遮蔽" in e for e in _r_past["errors"]))
+
+# 25. 抓取历史（rank_runs）：读写、累计、裁剪、导出
+_rdb6 = RankDatabase(os.path.join(tmp, "rank6.db"), logging.getLogger("t"))
+_rdb6.add_run(started_at="2026-10-01 09:00:00", source=SRC_BACKFILL, modes="daily",
+              days=1, days_ok=1, collected=100, downloaded=12, skipped=88,
+              failed=0, filtered_out=30, csv_count=1, elapsed=65.4, ok=True)
+_rdb6.add_run(started_at="2026-10-02 09:00:00", source="定时", modes="daily,weekly",
+              days=1, days_ok=0, collected=0, downloaded=0, failed=0,
+              ok=False, message="每日榜当天榜单尚未公布")
+_runs = _rdb6.runs()
+check("抓取历史：新的在前", _runs[0]["started_at"] == "2026-10-02 09:00:00")
+check("抓取历史：字段完整", _runs[1]["collected"] == 100 and _runs[1]["downloaded"] == 12)
+check("抓取历史：异常轮次 ok=0", _runs[0]["ok"] == 0)
+check("抓取历史：错误信息留档", "尚未公布" in (_runs[0]["message"] or ""))
+_tot = _rdb6.run_totals()
+check("抓取历史：累计轮次", _tot["rounds"] == 2)
+check("抓取历史：累计收录与新下载",
+      _tot["collected"] == 100 and _tot["downloaded"] == 12)
+check("抓取历史：累计耗时", abs(_tot["elapsed"] - 65.4) < 5)
+_p2 = os.path.join(tmp, "runs.csv")
+_n2 = _rdb6.export_runs_csv(_p2)
+check("抓取历史：导出 CSV 行数", _n2 == 2)
+_head = open(_p2, encoding="utf-8-sig").readline()
+check("抓取历史：CSV 表头含关键列",
+      "新下载" in _head and "来源" in _head and "榜单日期" in _head)
+check("抓取历史：清空后无记录", _rdb6.clear_runs() >= 1 and _rdb6.runs() == [])
+
+_rdb6.RUN_KEEP = 5      # 只影响这一个实例，不污染类默认值
+for i in range(20):
+    _rdb6.add_run(started_at=f"2026-11-{i + 1:02d} 09:00:00", source="定时",
+                  modes="daily", days=1, collected=1)
+check("抓取历史：超出上限自动裁剪", len(_rdb6.runs(limit=100)) == 5)
+check("抓取历史：保留的是最新的 5 条",
+      _rdb6.runs()[0]["started_at"] == "2026-11-20 09:00:00")
+
+# 26. 人话 TXT 摘要（跟 run.log 同目录，双击就能看）
+_txt = os.path.join(_log_dir(), "排行榜抓取历史.txt")
+if os.path.exists(_txt):
+    os.remove(_txt)
+_rdb7 = RankDatabase(os.path.join(tmp, "rank7.db"), logging.getLogger("t"))
+_p1 = _rdb7.append_run_txt(started_at="2026-10-19 09:00:00", source="定时",
+                           modes="daily,weekly", rank_date="2026-10-18", days=1,
+                           days_ok=1, collected=100, downloaded=7, skipped=93,
+                           filtered_out=42, elapsed=182.5, ok=True)
+check("TXT 摘要：路径在 logs 目录", _p1 == _txt and os.path.exists(_txt))
+_first = open(_txt, encoding="utf-8").read()
+check("TXT 摘要：新文件带说明头", _first.startswith("# 排行榜抓取历史"))
+check("TXT 摘要：内容含来源与下载数",
+      "定时" in _first and "新下载 7 部" in _first and "每日、每周" in _first)
+_rdb7.append_run_txt(started_at="2026-10-16 20:02:11", source=SRC_BACKFILL,
+                     modes="monthly", rank_date="2026-10-16", date_from="2026-09-17",
+                     days=30, days_ok=12, collected=612, downloaded=88,
+                     skipped=524, elapsed=931.4, ok=True)
+_rdb7.append_run_txt(started_at="2026-10-15 09:00:01", source="定时", modes="daily",
+                     days=1, days_ok=0, collected=0, downloaded=0, ok=False,
+                     message="每日榜当天榜单尚未公布")
+_body = open(_txt, encoding="utf-8").read()
+_lines = [x for x in _body.splitlines() if x and not x.startswith("#")]
+check("TXT 摘要：追加 3 行（说明头不重复）", len(_lines) == 3)
+check("TXT 摘要：补抓显示日期区间", "2026-09-17 ~ 2026-10-16" in _body)
+check("TXT 摘要：补抓显示有数据天数", "30 天中 12 天有数据" in _body)
+check("TXT 摘要：异常行带标记与原因",
+      "【有异常】" in _body and "尚未公布" in _body)
+check("TXT 摘要：无数据时榜单日期占位", _lines[2].split("|")[3].strip() == "-")
+_rdb7.close()
+
 print()
 if failures:
     print("失败项：", failures)

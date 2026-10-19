@@ -488,7 +488,10 @@ QTabBar::tab:selected {
 }
 
 /* ============================ 表格 ============================ */
-QTableWidget, QTableView {
+/* 注意：这里只写 QTableWidget，不要再写 QTableView。
+   QCalendarWidget 内部就是一个 QTableView，一旦给它加内边距，
+   单元格太小，两位数日期（10~31）会显示不出来。 */
+QTableWidget {
     background: $surface;
     alternate-background-color: $surface_alt;
     border: 1px solid $border;
@@ -497,15 +500,15 @@ QTableWidget, QTableView {
     selection-background-color: $accent_soft;
     selection-color: $accent_text;
 }
-QTableWidget::item, QTableView::item {
+QTableWidget::item {
     padding: 7px 10px;
     border: none;
 }
-QTableWidget::item:selected, QTableView::item:selected {
+QTableWidget::item:selected {
     background: $accent_soft;
     color: $accent_text;
 }
-QTableWidget::item:hover, QTableView::item:hover { background: $surface_hover; }
+QTableWidget::item:hover { background: $surface_hover; }
 QHeaderView::section {
     background: $surface_alt;
     color: $text_dim;
@@ -523,6 +526,41 @@ QTableCornerButton::section {
     border: none;
     border-bottom: 1px solid $border;
 }
+
+/* ========================== 日历（日期选择器） ==========================
+   内部是 QTableView，必须显式接管配色，别让它继承上面表格那套规则。 */
+QCalendarWidget QWidget {
+    background: $surface;
+    alternate-background-color: $surface;
+}
+QCalendarWidget QAbstractItemView:enabled {
+    background: $surface;
+    color: $text;
+    selection-background-color: $accent_soft;
+    selection-color: $accent_text;
+}
+QCalendarWidget QAbstractItemView:disabled {
+    color: $text_muted;
+}
+QCalendarWidget QWidget#qt_calendar_navigationbar { background: $surface_alt; }
+/* 导航栏里的年/月按钮和前后箭头必须显式指定，否则会用系统默认的蓝色渐变 */
+QCalendarWidget QWidget#qt_calendar_navigationbar QToolButton {
+    background: $surface_alt;
+    color: $text;
+}
+QCalendarWidget QWidget#qt_calendar_navigationbar QSpinBox {
+    background: $surface;
+    color: $text;
+}
+QCalendarWidget QToolButton {
+    color: $text;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+QCalendarWidget QToolButton:hover { background: $surface_hover; }
+QCalendarWidget QMenu { background: $surface; color: $text; }
 
 /* ============================ 日志 ============================ */
 QPlainTextEdit[class="log"] {

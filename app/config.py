@@ -117,6 +117,17 @@ class Settings:
     auto_backup_enabled: bool = True      # 每轮抓取前自动备份索引与设置(含 Cookie)
     auto_backup_keep: int = 5             # 自动备份保留份数
 
+    # --- 六、小说排行榜（独立任务，不跟随每日抓取）---
+    ranking_enabled: bool = False         # 是否启用排行榜抓取
+    ranking_modes: list = field(default_factory=lambda: ["daily", "weekly"])
+    ranking_include_r18: bool = False     # 是否抓取 R-18 榜单（需要登录 Cookie）
+    ranking_download: bool = True         # 是否顺便下载正文（复用单篇管线）
+    ranking_download_mode: str = "new"    # new=仅首次上榜下载 / follow_update=跟随更新判定
+    ranking_language_filter: bool = True  # 只保留简体中文作品（R-18 榜同样处理）
+    ranking_csv_enabled: bool = True      # 每次抓取后在下方目录自动生成一份 CSV
+    ranking_csv_dir: str = ""             # CSV 存放目录；留空则用数据目录下的 rank_csv
+    ranking_txt_log: bool = True          # 每次抓取后往 logs 目录追加一行人话摘要（可直接双击看）
+
     @property
     def md_separate(self) -> bool:
         return bool(self.md_root.strip())

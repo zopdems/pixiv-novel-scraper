@@ -13,10 +13,11 @@ from PySide6.QtWidgets import (
 
 from .. import credentials
 from ..autostart import set_autostart
-from ..config import reset_advanced_settings, save_settings as persist_settings
+from ..config import app_data_dir, reset_advanced_settings, save_settings as persist_settings
 from ..core import paths
 from ..core.db import DISABLE_REASON_MANUAL
 from ..core.models import STATUS_LABELS, Status, status_label
+from ..core.rank_db import RANK_MODES, RankDatabase, mode_label
 from ..core.utils import extract_author_id
 from ..pixiv.client import PixivClient
 from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
@@ -25,6 +26,7 @@ from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
                             decorate_name_item, resolve_author_status,
                             status_text)
 from .icons import app_mark, icon
+from .ranking_page import RankingPageMixin
 from .theme import apply_theme, current_mode, resolve_mode, tokens
 from .worker import RebuildMdWorker, ScrapeWorker
 
@@ -91,7 +93,7 @@ class BatchImportDialog(QDialog):
         return out
 
 
-class MainWindow(QMainWindow):
+class MainWindow(QMainWindow, RankingPageMixin):
     def __init__(self, settings, db, logger):
         super().__init__()
         self.settings = settings
@@ -99,13 +101,20 @@ class MainWindow(QMainWindow):
         self.logger = logger
         self.worker = None
         self.md_worker = None
+        self.rank_worker = None
         self.last_report = None
+        try:
+            self.rank_db = RankDatabase(os.path.join(app_data_dir(), "rank.db"), logger)
+        except Exception:
+            self.rank_db = None
         self.on_fetch_done = None
+        self.on_ranking_done = None
         self.on_theme_changed = None
 
         self.setWindowTitle("Pixiv 小说抓取器")
         self.resize(1140, 740)
-        self.setMinimumSize(940, 620)
+        # 最小尺寸别给太小：高 DPI 缩放下内容需要更多像素，太窄会挤到文字显示不全
+        self.setMinimumSize(1024, 660)
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -128,6 +137,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_authors_page())
         self.stack.addWidget(self._build_tasks_page())
         self.stack.addWidget(self._build_search_page())
+        self.stack.addWidget(self._build_ranking_page())
         self.stack.addWidget(self._build_settings_page())
 
         self.stat_label = QLabel("")
@@ -197,7 +207,7 @@ class MainWindow(QMainWindow):
 
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        for name in ["作者", "任务", "检索", "设置"]:
+        for name in ["作者", "任务", "检索", "排行", "设置"]:
             self.nav.addItem(name)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         v.addWidget(self.nav, 1)
@@ -207,6 +217,15 @@ class MainWindow(QMainWindow):
         tip.setWordWrap(True)
         v.addWidget(tip)
         return side
+
+    @staticmethod
+    def _wrap_layout(layout) -> QWidget:
+        """把布局包成 QWidget，便于放进 QFormLayout 的某一行。"""
+        w = QWidget()
+        l = QHBoxLayout(w)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addLayout(layout)
+        return w
 
     def _card(self, margin=14, spacing=10):
         frame = QFrame()
@@ -1049,7 +1068,7 @@ class MainWindow(QMainWindow):
         self.settings_nav.setObjectName("subnav")
         self.settings_nav.addItems([
             "外观", "存储路径", "抓取策略", "文件输出", "内容编排", "更新策略",
-            "网络", "登录 Cookie", "系统",
+            "网络", "登录 Cookie", "系统", "排行榜",
         ])
         nc.addWidget(self.settings_nav)
         body.addWidget(nav_card)
@@ -1458,6 +1477,79 @@ class MainWindow(QMainWindow):
         hint(form, "备份保存在数据目录下的 backups 文件夹，"
                    "内容与手动导出一致、明文包含 Cookie，请勿外传或上传；超出份数的旧备份会自动删除。")
 
+        # ---- 排行榜 ----
+        form = make_page()
+        section(form, "启用")
+        self.set_ranking_enabled = QCheckBox("启用排行榜抓取（独立任务，不跟随每日抓取）")
+        self.set_ranking_enabled.setChecked(bool(getattr(s, "ranking_enabled", False)))
+        form.addRow("", self.set_ranking_enabled)
+        hint(form, "开启后可在「排行」页面抓取榜单；也可随时手动点「抓取榜单」。"
+                   "此项为独立任务，不会并入每日的名单抓取。")
+
+        section(form, "每日自动抓取哪些榜单")
+        self.rank_mode_boxes = {}
+        modes_row = QHBoxLayout()
+        modes_row.setSpacing(10)
+        for m in RANK_MODES:
+            box = QCheckBox(mode_label(m))
+            box.setChecked(m in (getattr(s, "ranking_modes", []) or []))
+            self.rank_mode_boxes[m] = box
+            modes_row.addWidget(box)
+        modes_row.addStretch(1)
+        form.addRow("榜单", self._wrap_layout(modes_row))
+        hint(form, "只影响定时任务每天自动抓的榜。「排行」页面里的榜单下拉是临时查看/手动抓取用的，"
+                   "两者互不影响——手动抓哪个以页面下拉框为准。")
+
+        self.set_ranking_r18 = QCheckBox("同时抓取 R-18 榜单（需要登录 Cookie，否则会 403）")
+        self.set_ranking_r18.setChecked(bool(getattr(s, "ranking_include_r18", False)))
+        form.addRow("", self.set_ranking_r18)
+        hint(form, "注意：即使抓取了 R-18 榜单，正文是否下载仍受「抓取策略 → 包含 R-18」控制，"
+                   "全局未开启时只会记录元信息。")
+
+        section(form, "正文下载")
+        self.set_ranking_download = QCheckBox("一并下载上榜作品的正文")
+        self.set_ranking_download.setChecked(bool(getattr(s, "ranking_download", True)))
+        form.addRow("", self.set_ranking_download)
+
+        self.set_ranking_dl_mode = QComboBox()
+        self.set_ranking_dl_mode.addItem("仅下载首次上榜 / 本地缺失的作品（推荐）", "new")
+        self.set_ranking_dl_mode.addItem("每次都走更新判定（多一次详情请求）", "follow_update")
+        idx = self.set_ranking_dl_mode.findData(
+            str(getattr(s, "ranking_download_mode", "new") or "new"))
+        self.set_ranking_dl_mode.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("下载范围", self.set_ranking_dl_mode)
+        hint(form, "默认只在作品首次上榜时下载正文。一部作品连续霸榜时，后续每天对正文发 0 次请求，"
+                   "不会重复下载。")
+
+        self.set_ranking_lang = QCheckBox("只保留简体中文作品（R-18 榜同样处理）")
+        self.set_ranking_lang.setChecked(bool(getattr(s, "ranking_language_filter", True)))
+        form.addRow("", self.set_ranking_lang)
+        hint(form, "实测综合榜里中文作品很少（每日榜 100 条中通常只有 0~1 条，男性向榜约 5 条），"
+                   "过滤后部分榜单可能为空，属正常现象。")
+
+        section(form, "抓取记录自动保存")
+        self.set_ranking_csv = QCheckBox("每次抓取后自动生成一份 CSV")
+        self.set_ranking_csv.setChecked(bool(getattr(s, "ranking_csv_enabled", True)))
+        form.addRow("", self.set_ranking_csv)
+
+        csv_row = QHBoxLayout()
+        csv_row.setSpacing(8)
+        self.set_ranking_csv_dir = QLineEdit()
+        self.set_ranking_csv_dir.setPlaceholderText("留空则存放在数据目录下的 rank_csv")
+        self.set_ranking_csv_dir.setText(str(getattr(s, "ranking_csv_dir", "") or ""))
+        btn_csv_dir = QPushButton("浏览")
+        btn_csv_dir.clicked.connect(self.pick_ranking_csv_dir)
+        csv_row.addWidget(self.set_ranking_csv_dir, 1)
+        csv_row.addWidget(btn_csv_dir)
+        form.addRow("存放目录", self._wrap_layout(csv_row))
+        hint(form, "文件名形如「排行榜_daily_2026-10-17.csv」；同一天重复抓取会覆盖，不会堆积重复文件。")
+
+        self.set_ranking_txt = QCheckBox("同时追加一行到「排行榜抓取历史.txt」")
+        self.set_ranking_txt.setChecked(bool(getattr(s, "ranking_txt_log", True)))
+        form.addRow("", self.set_ranking_txt)
+        hint(form, "放在数据目录的 logs 里，跟程序运行日志 run.log 挨着，双击就能看，"
+                   "不需要打开本软件。每行一轮，内容和「排行榜 → 抓取历史」完全一致。")
+
         self.settings_nav.setCurrentRow(0)
         return page
 
@@ -1594,7 +1686,22 @@ class MainWindow(QMainWindow):
         s.author_rename_migrate = self.set_rename_mig.isChecked()
         s.auto_backup_enabled = self.set_auto_backup.isChecked()
         s.auto_backup_keep = int(self.set_backup_keep.value())
+        s.ranking_enabled = self.set_ranking_enabled.isChecked()
+        s.ranking_modes = [m for m, box in self.rank_mode_boxes.items() if box.isChecked()]
+        s.ranking_include_r18 = self.set_ranking_r18.isChecked()
+        s.ranking_download = self.set_ranking_download.isChecked()
+        s.ranking_download_mode = str(self.set_ranking_dl_mode.currentData() or "new")
+        s.ranking_language_filter = self.set_ranking_lang.isChecked()
+        s.ranking_csv_enabled = self.set_ranking_csv.isChecked()
+        s.ranking_csv_dir = self.set_ranking_csv_dir.text().strip()
+        s.ranking_txt_log = self.set_ranking_txt.isChecked()
         return s
+
+    def pick_ranking_csv_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择排行榜 CSV 存放目录",
+                                            self.set_ranking_csv_dir.text().strip() or "")
+        if d:
+            self.set_ranking_csv_dir.setText(d)
 
     def _sync_advanced_controls(self):
         """把 settings 中的高级设置回填到界面控件。"""
@@ -1729,7 +1836,7 @@ class MainWindow(QMainWindow):
         ):
             btn.setIcon(icon(name, dim, 17))
 
-        self._decorate_nav(self.nav, ["users", "activity", "search", "sliders"])
+        self._decorate_nav(self.nav, ["users", "activity", "search", "gauge", "sliders"])
         self._decorate_nav(self.settings_nav,
                            ["palette", "folder", "gauge", "globe", "key", "database"])
 

@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from .autostart import set_autostart
 from .config import load_settings, save_settings
 from .core.db import Database
+from .core.rank_db import SRC_SCHEDULED
 from .credentials import load_cookie
 from .logging_setup import setup_logging
 from .scheduler import DailyScheduler
@@ -62,6 +63,11 @@ def main():
         settings.fetch_time,
         int(getattr(settings, "catch_up_window_minutes", 0) or 0),
     )
+    # 排行榜独立一个调度器，避免与主抓取共用一次触发（should_run 是一次性的）
+    rank_scheduler = DailyScheduler(
+        settings.fetch_time,
+        int(getattr(settings, "catch_up_window_minutes", 0) or 0),
+    )
 
     def notify_report(report):
         if getattr(report, "auth_expired", False):
@@ -76,6 +82,27 @@ def main():
 
     window.on_fetch_done = notify_report
 
+    def notify_ranking(report):
+        """排行榜任务的完成通知（定时抓取时通常人在别的页面，靠这个看到结果）。"""
+        r = report or {}
+        if r.get("auth_expired"):
+            tray.notify("Cookie 已失效", "排行榜抓取中止，请重新导入登录 Cookie")
+            return
+        if r.get("errors") and not r.get("collected"):
+            tray.notify("排行榜抓取未取到数据", str(r["errors"][0])[:80])
+            return
+        if r.get("days"):
+            tray.notify("排行榜补抓完成",
+                        f"{len(r['days'])} 天中 {r.get('days_ok', 0)} 天有数据，"
+                        f"共收录 {r.get('collected', 0)} 条")
+            return
+        tray.notify("排行榜抓取完成",
+                    f"收录 {r.get('collected', 0)} 条"
+                    + (f"，新下载小说 {r.get('downloaded', 0)} 部"
+                       if r.get("downloaded") else "，无新作品需下载"))
+
+    window.on_ranking_done = notify_ranking
+
     tray = TrayIcon(window, on_fetch=window.start_fetch, on_quit=window.force_quit)
     tray.show()
     window.on_theme_changed = tray.refresh_icons
@@ -83,6 +110,21 @@ def main():
     def tick():
         scheduler.set_time(settings.fetch_time)
         scheduler.set_catch_up_window(int(getattr(settings, "catch_up_window_minutes", 0) or 0))
+
+        # ---- 排行榜：独立开关、独立触发，不依赖作者名单与主抓取 ----
+        if getattr(settings, "ranking_enabled", False):
+            rank_scheduler.set_time(settings.fetch_time)
+            rank_scheduler.set_catch_up_window(
+                int(getattr(settings, "catch_up_window_minutes", 0) or 0))
+            busy = (window.worker and window.worker.isRunning()) or \
+                (window.rank_worker and window.rank_worker.isRunning())
+            if not busy and rank_scheduler.should_run():
+                logger.info("定时任务触发：抓取小说排行榜")
+                # 定时任务抓「设置里勾选的所有榜单」，与页面手动抓取（单个榜）区分开
+                window.fetch_ranking(use_all_modes=True, source=SRC_SCHEDULED)
+            elif busy and rank_scheduler.pending_today():
+                logger.info("排行榜定时任务等待：已有任务进行中，稍后空闲再触发")
+
         if not scheduler.should_run():
             return
         if not load_cookie():
