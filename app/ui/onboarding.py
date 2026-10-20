@@ -26,10 +26,8 @@ class _StepPage(QWizardPage):
         badge = QLabel(str(step))
         badge.setFixedSize(34, 34)
         badge.setAlignment(Qt.AlignCenter)
-        badge.setStyleSheet(
-            "background: %s; color: %s; border-radius: 17px;"
-            "font-size: 14px; font-weight: 700;" % (t["accent_soft"], t["accent_text"])
-        )
+        # 形状与配色交给主题的 QLabel[class="step-num"]，切换主题时自动跟随
+        badge.setProperty("class", "step-num")
         head.addWidget(badge, 0, Qt.AlignTop)
 
         text_col = QVBoxLayout()
@@ -38,7 +36,6 @@ class _StepPage(QWizardPage):
 
         lbl_title = QLabel(title)
         lbl_title.setProperty("class", "page-title")
-        lbl_title.setStyleSheet("font-size: 17px;")
         lbl_sub = QLabel(subtitle)
         lbl_sub.setProperty("class", "page-sub")
         lbl_sub.setWordWrap(True)
@@ -55,7 +52,7 @@ class _StepPage(QWizardPage):
 
         line = QLabel()
         line.setFixedHeight(1)
-        line.setStyleSheet("background: %s;" % t["border"])
+        line.setProperty("class", "rule")
         layout.addSpacing(4)
         layout.addWidget(line)
         layout.addSpacing(10)
@@ -125,7 +122,7 @@ class CookiePage(_StepPage):
 
         self.cookie_edit = QPlainTextEdit()
         self.cookie_edit.setPlaceholderText("PHPSESSID=xxxx 或完整 Cookie 字符串")
-        self.cookie_edit.setFixedHeight(84)
+        self.cookie_edit.setFixedHeight(tokens(current_mode())["edit_area_h"])
         layout.addWidget(self.cookie_edit)
 
         self.result_label = QLabel("")
@@ -185,7 +182,7 @@ class AuthorPage(_StepPage):
 
         self.ids_edit = QPlainTextEdit()
         self.ids_edit.setPlaceholderText("例如：1234567, 8901234")
-        self.ids_edit.setFixedHeight(84)
+        self.ids_edit.setFixedHeight(tokens(current_mode())["edit_area_h"])
         layout.addWidget(self.ids_edit)
 
         self.result_label = QLabel("")
@@ -231,8 +228,6 @@ class RiskPage(_StepPage):
         )
         box.setWordWrap(True)
         box.setProperty("class", "soft")
-        box.setContentsMargins(14, 12, 14, 12)
-        box.setStyleSheet("QLabel { padding: 12px 14px; border-radius: 10px; }")
         layout.addWidget(box)
 
         self.agree = QCheckBox("我已知悉并自行承担风险")
@@ -262,18 +257,20 @@ class OnboardingWizard(QWizard):
         self.setButtonText(QWizard.FinishButton, "完成")
         self.setButtonText(QWizard.CancelButton, "取消")
         self.setPixmap(QWizard.LogoPixmap, QPixmap(app_mark(48)))
-        self.resize(620, 470)
+        self._fit_to_screen()
 
-    def _tune_header(self):
-        """ModernStyle 的标题标签由 Qt 内部创建，这里按对象名补上排版。"""
-        t = tokens(current_mode())
-        for lbl in self.findChildren(QLabel):
-            name = lbl.objectName() or ""
-            if name.endswith("subtitlelabel"):
-                lbl.setStyleSheet("font-size: 12.5px; color: %s;" % t["text_dim"])
-            elif name.endswith("titlelabel"):
-                lbl.setStyleSheet("font-size: 19px; font-weight: 700; color: %s;" % t["text"])
+    def _fit_to_screen(self):
+        """按屏幕可用区域决定初始尺寸，小屏 / 高缩放比下不被裁切。"""
+        try:
+            from PySide6.QtWidgets import QApplication
+            scr = (QApplication.primaryScreen() or (self.screen()))
+            avail = scr.availableGeometry() if scr else None
+        except Exception:
+            avail = None
+        if avail is None:
+            self.resize(620, 470)
+            return
+        w = max(520, min(620, int(avail.width() * 0.92)))
+        h = max(400, min(470, int(avail.height() * 0.92)))
+        self.resize(w, h)
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._tune_header()

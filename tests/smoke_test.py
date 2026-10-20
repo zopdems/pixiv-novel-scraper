@@ -21,8 +21,8 @@ from app.scheduler import DailyScheduler
 failures = []
 
 
-def check(name, cond):
-    print(("PASS" if cond else "FAIL"), name)
+def check(name, cond, extra=""):
+    print(("PASS" if cond else "FAIL"), name + (f"  {extra}" if extra else ""))
     if not cond:
         failures.append(name)
 
@@ -854,6 +854,126 @@ check("TXT 摘要：异常行带标记与原因",
       "【有异常】" in _body and "尚未公布" in _body)
 check("TXT 摘要：无数据时榜单日期占位", _lines[2].split("|")[3].strip() == "-")
 _rdb7.close()
+
+# ==================================================================
+# UI 结构回归（只需要结构，不需要字体渲染，用 offscreen 即可）
+# ==================================================================
+_UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "ui")
+
+# 1. 令牌：浅色 / 深色都要带上同一套尺寸令牌
+from app.ui.theme import METRICS, tokens as ui_tokens  # noqa: E402
+check("UI 令牌：浅色含尺寸令牌",
+      all(ui_tokens("light")[k] == v for k, v in METRICS.items()))
+check("UI 令牌：深色含尺寸令牌",
+      all(ui_tokens("dark")[k] == v for k, v in METRICS.items()))
+
+# 2. 源码层面：不允许再出现内联样式绕过主题
+_inline = []
+for _fn in ("main_window.py", "ranking_page.py", "onboarding.py", "widgets.py"):
+    with open(os.path.join(_UI_DIR, _fn), encoding="utf-8") as _fh:
+        _inline += [ln for ln in _fh if "setStyleSheet(" in ln]
+check("UI 规范：业务文件无内联 setStyleSheet", not _inline, str(_inline))
+
+# 3. 添加作者用的是解析后的 ID（历史 bug：写成未定义的 text，点添加直接崩）
+with open(os.path.join(_UI_DIR, "main_window.py"), encoding="utf-8") as _fh:
+    _mw = _fh.read()
+check("作者添加：调用 add_author 传的是 aid", "self.db.add_author(aid," in _mw)
+
+try:
+    from PySide6.QtWidgets import (QApplication, QFrame,  # noqa: E402
+                                   QLabel, QTableWidget)
+    from PySide6.QtCore import Qt as _Qt  # noqa: E402
+    _HAS_QT = True
+except Exception:
+    _HAS_QT = False
+
+if not _HAS_QT:
+    print("SKIP UI 结构回归：未安装 PySide6")
+else:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    _app = QApplication.instance() or QApplication([])
+    from app.ui.main_window import (  # noqa: E402
+        MAIN_SECTIONS, PAGE_RANKING, PAGE_SETTINGS, SETTINGS_SECTIONS, MainWindow)
+
+    check("页面顺序常量：设置页是最后一个",
+          PAGE_SETTINGS == 4 and PAGE_RANKING == 3)
+
+    _db = Database(os.path.join(os.environ["PIXIV_DATA_DIR"], "ui_index.db"), None)
+    _w = MainWindow(Settings(), _db, None)
+
+    check("一级导航项数与常量一致", _w.nav.count() == len(MAIN_SECTIONS))
+    check("设置小节跳转条项数一致",
+          _w.settings_rail.count() == len(SETTINGS_SECTIONS))
+    check("设置小节实际组数一致",
+          len(_w._settings_groups) == len(SETTINGS_SECTIONS))
+
+    # 跳设置页：历史上写死索引 3，实际跳到了排行榜页
+    _w.nav.setCurrentIndex(0)
+    _w.select_settings_tab()
+    _cookie_idx = [lb for lb, *_ in SETTINGS_SECTIONS].index("登录 Cookie")
+    check("跳设置页：落在设置页而不是排行榜页", _w.stack.currentIndex() == PAGE_SETTINGS)
+    check("跳设置页：导航同步高亮", _w.nav.currentIndex() == PAGE_SETTINGS)
+    check("跳设置页：直达登录 Cookie 小节",
+          _w.settings_rail.currentIndex() == _cookie_idx)
+
+    # 旧版「浮起圆角卡片」不再出现，分区改用发丝线
+    _floating = [f for f in _w.findChildren(QFrame)
+                 if f.property("class") in ("card", "panel")]
+    check("已移除旧版浮起卡片", not _floating, str(len(_floating)))
+    _rules = [w for w in _w.findChildren(QFrame) if w.property("class") == "rule"]
+    _rules += [w for w in _w.findChildren(QLabel) if w.property("class") == "rule"]
+    check("分区改用发丝线", len(_rules) >= 10, str(len(_rules)))
+
+    # 指标卡：作者页顶部四个指标必须存在且走 metric 样式
+    check("指标卡：名单作者", _w.m_authors.value_label.property("class") == "metric")
+    check("指标卡：待处理", _w.m_failed.value_label.property("class").startswith("metric"))
+
+    # 日志抽屉：主抓取与榜单日志共用同一个入口
+    check("日志抽屉：抓取日志挂到第 1 页", _w.drawer.view(0) is _w.progress_view)
+    check("日志抽屉：榜单日志挂到第 2 页", _w.drawer.view(1) is _w.rank_log_view)
+
+    # 命令栏响应式：窄屏优先保住导航与主操作
+    _w.resize(900, 600)
+    _w._apply_responsive()
+    check("窄屏隐藏品牌名与命令栏搜索",
+          not _w.brand_label.isVisibleTo(_w) and not _w.global_search.isVisibleTo(_w))
+    _w.resize(1200, 760)
+    _w._apply_responsive()
+    check("宽屏显示品牌名与命令栏搜索",
+          _w.brand_label.isVisibleTo(_w) and _w.global_search.isVisibleTo(_w))
+
+    # 所有表格行高一致
+    _rows = {_t.verticalHeader().defaultSectionSize()
+             for _t in _w.findChildren(QTableWidget)}
+    check("全部表格行高统一", len(_rows) == 1, str(sorted(_rows)))
+
+    # 添加作者：历史上这里传的是未定义的 text，点「添加」必抛 NameError
+    _w.author_tabs.setCurrentIndex(0)
+    _w.author_input.setText("99001122")
+    try:
+        _w.add_author()
+        _added = _db.get_author("99001122", kind="novel") is not None
+    except Exception as _e:  # noqa: BLE001
+        _added = False
+        print("   添加作者抛异常：", repr(_e))
+    check("作者添加：点「添加」真的能入库", _added)
+    _w.author_input.setText("https://www.pixiv.net/users/99001123")
+    try:
+        _w.add_author()
+        _added_url = _db.get_author("99001123", kind="novel") is not None
+    except Exception as _e:  # noqa: BLE001
+        _added_url = False
+        print("   按链接添加抛异常：", repr(_e))
+    check("作者添加：粘贴主页链接也能入库", _added_url)
+    for _name, _tbl in (("作者表", _w.novel_author_table), ("插画作者表", _w.illust_author_table),
+                        ("失败表", _w.failed_table), ("检索表", _w.search_table),
+                        ("排行榜作品表", _w.rank_table), ("排行榜作者表", _w.rank_author_table)):
+        check(f"右键菜单：{_name}",
+              _tbl.contextMenuPolicy() == _Qt.CustomContextMenu)
+
+    # 屏幕自适应：最小尺寸必须放得进常见的小屏（1366×768 @125% ≈ 1092×614）
+    check("最小宽度放进 1092 逻辑像素", _w.minimumWidth() <= 1092)
+    check("最小高度放进 614 逻辑像素", _w.minimumHeight() <= 614)
 
 print()
 if failures:
