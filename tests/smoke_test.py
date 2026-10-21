@@ -855,6 +855,69 @@ check("TXT 摘要：异常行带标记与原因",
 check("TXT 摘要：无数据时榜单日期占位", _lines[2].split("|")[3].strip() == "-")
 _rdb7.close()
 
+# ---- 账号状态检查（作者管理页手动校验入口）----
+import logging as _ac_logging  # noqa: E402
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+import app.ui.worker as _ui_worker  # noqa: E402
+from app.config import Settings as _AcSettings  # noqa: E402
+from app.pixiv import api as _pixiv_api  # noqa: E402
+from app.ui.worker import AuthorCheckWorker  # noqa: E402
+
+_ac_app = QCoreApplication.instance() or QCoreApplication([])
+_ac_db = Database(path=os.path.join(tempfile.mkdtemp(), "ac.db"))
+_ac_db.add_author("90001", "已注销作者", kind="novel")
+_ac_db.add_author("90002", "旧昵称", kind="novel")
+_ac_db.add_author("90003", "网络异常作者", kind="novel")
+
+
+def _ac_fake_status(client, user_id):
+    """90001 已注销 / 90002 正常但改了名 / 90003 查询失败。"""
+    if user_id == "90001":
+        return False, ""
+    if user_id == "90002":
+        return True, "新昵称"
+    raise RuntimeError("模拟风控 403")
+
+
+class _AcFakeClient:
+    def close(self):
+        pass
+
+
+_ac_api, _ac_client, _ac_cookie = (
+    _pixiv_api.get_user_status, _ui_worker.PixivClient, _ui_worker.load_cookie)
+_pixiv_api.get_user_status = _ac_fake_status
+_ui_worker.PixivClient = lambda *a, **k: _AcFakeClient()
+_ui_worker.load_cookie = lambda: "fake-cookie"
+
+_ac_res = {}
+_ac_worker = AuthorCheckWorker(
+    _AcSettings(), _ac_db, _ac_logging.getLogger("t"),
+    [("90001", "novel"), ("90002", "novel"), ("90003", "novel")])
+_ac_worker.finished_result.connect(_ac_res.update)
+_ac_worker.run()
+
+check("账号检查：已注销作者被自动停用",
+      _ac_db.get_author("90001", kind="novel")["enabled"] == 0)
+check("账号检查：停用原因记为「已注销」",
+      _ac_db.author_disable_reason("90001", "novel") == "deactivated")
+check("账号检查：昵称变化时写回数据库",
+      _ac_db.get_author("90002", kind="novel")["author_name"] == "新昵称")
+check("账号检查：查询失败进 unknown，不冒充正常",
+      [x["aid"] for x in _ac_res.get("unknown", [])] == ["90003"])
+check("账号检查：查询失败的作者保持启用",
+      _ac_db.get_author("90003", kind="novel")["enabled"] == 1)
+check("账号检查：注销与改名各归一类",
+      len(_ac_res.get("deactivated", [])) == 1 and len(_ac_res.get("renamed", [])) == 1)
+check("账号检查：正常作者计入 alive",
+      len(_ac_res.get("alive", [])) == 0 and "90003" not in str(_ac_res.get("alive")))
+
+_pixiv_api.get_user_status, _ui_worker.PixivClient, _ui_worker.load_cookie = (
+    _ac_api, _ac_client, _ac_cookie)
+_ac_db.close()
+
 print()
 if failures:
     print("失败项：", failures)

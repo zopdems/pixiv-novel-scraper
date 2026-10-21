@@ -28,7 +28,7 @@ from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
 from .icons import app_mark, icon
 from .ranking_page import RankingPageMixin
 from .theme import apply_theme, current_mode, resolve_mode, tokens
-from .worker import RebuildMdWorker, ScrapeWorker
+from .worker import AuthorCheckWorker, RebuildMdWorker, ScrapeWorker
 
 _AUTHOR_ID_RE = re.compile(r"^\d+$")
 
@@ -308,12 +308,20 @@ class MainWindow(QMainWindow, RankingPageMixin):
         btn_open.clicked.connect(self.open_author_page)
         btn_toggle = QPushButton("启用 / 停用")
         btn_toggle.clicked.connect(self.toggle_author)
+        # 抓取时只在「没昵称 / 远端零作品」时才查账号，已注销但列表仍有返回的作者会漏判；
+        # 这个按钮可以随时手动查一次，把漏掉的那批找出来
+        self.btn_check_author = QPushButton("检查账号状态")
+        self.btn_check_author.setToolTip(
+            "逐个查询 Pixiv：账号已注销的作者会自动停用并标为「已注销」。\n"
+            "先选中行可只查选中的作者（支持多选），不选中则询问是否检查整个名单。")
+        self.btn_check_author.clicked.connect(self.check_author_status)
         btn_del = QPushButton("删除")
         btn_del.setProperty("class", "danger")
         btn_del.clicked.connect(self.delete_author)
         row.addWidget(self.btn_rebuild_md)
         row.addWidget(btn_open)
         row.addWidget(btn_toggle)
+        row.addWidget(self.btn_check_author)
         row.addWidget(btn_del)
         bl.addLayout(row)
         outer.addWidget(bar)
@@ -437,6 +445,90 @@ class MainWindow(QMainWindow, RankingPageMixin):
         if row < 0:
             return None
         return table.item(row, 1).text()
+
+    def _selected_author_ids(self) -> list:
+        """当前选中的所有作者 ID（按行号排序、去重）。"""
+        table = self._active_author_table()
+        if table is None:
+            return []
+        ids, seen = [], set()
+        for row in sorted({idx.row() for idx in table.selectedIndexes()}):
+            item = table.item(row, 1)
+            text = item.text() if item else ""
+            if text and text not in seen:
+                seen.add(text)
+                ids.append(text)
+        return ids
+
+    def check_author_status(self):
+        """手动查询作者账号是否仍然存在，已注销的自动停用。"""
+        if getattr(self, "_author_checker", None) and self._author_checker.isRunning():
+            return
+        kind = self._active_author_kind()
+        if not kind:
+            QMessageBox.information(self, "提示", "请先切到「小说作者」或「插画作者」标签页。")
+            return
+        label = "小说" if kind == "novel" else "插画"
+        aids = self._selected_author_ids()
+        if not aids:
+            authors = self.db.list_authors(kind=kind)
+            if not authors:
+                QMessageBox.information(self, "提示", f"{label}名单里还没有作者。")
+                return
+            if QMessageBox.question(
+                    self, "检查账号状态",
+                    f"没有选中任何行。要检查{label}名单里的全部 {len(authors)} 位作者吗？\n"
+                    f"每位作者会查询一次 Pixiv，数量较多时请注意风控。") != QMessageBox.Yes:
+                return
+            aids = [a["author_id"] for a in authors]
+        self.btn_check_author.setEnabled(False)
+        self.btn_check_author.setText("检查中…")
+        self._author_checker = AuthorCheckWorker(
+            self.settings, self.db, self.logger, [(a, kind) for a in aids])
+        self._author_checker.progress.connect(self._on_author_check_progress)
+        self._author_checker.finished_result.connect(self._on_author_check_done)
+        self._author_checker.start()
+
+    def _on_author_check_progress(self, event: dict):
+        self.btn_check_author.setText(
+            f"检查中 {event.get('index', 0)}/{event.get('total', 0)}")
+
+    def _on_author_check_done(self, result: dict):
+        self.btn_check_author.setEnabled(True)
+        self.btn_check_author.setText("检查账号状态")
+        err = (result or {}).get("error")
+        if err:
+            QMessageBox.warning(self, "检查未完成", err)
+            return
+        gone = result.get("deactivated") or []
+        renamed = result.get("renamed") or []
+        alive = result.get("alive") or []
+        unknown = result.get("unknown") or []
+        self.refresh_authors()
+        total = len(gone) + len(renamed) + len(alive) + len(unknown)
+        lines = [f"共检查 {total} 位作者：",
+                 f"账号正常 {len(alive)} 位，已注销 {len(gone)} 位，"
+                 f"昵称更新 {len(renamed)} 位，未能确认 {len(unknown)} 位。"]
+        if gone:
+            lines.append("")
+            lines.append("已注销（已自动停用，本地作品保留）：")
+            lines.append("、".join(x["aid"] for x in gone[:15])
+                         + ("…" if len(gone) > 15 else ""))
+        if renamed:
+            lines.append("")
+            lines.append("昵称已更新：" + "、".join(
+                f"{x['aid']}→{x['name']}" for x in renamed[:8])
+                + ("…" if len(renamed) > 8 else ""))
+        if unknown:
+            lines.append("")
+            lines.append("未能确认（多为网络或风控，不算正常，可稍后重试）：")
+            lines.append("、".join(x["aid"] for x in unknown[:15])
+                         + ("…" if len(unknown) > 15 else ""))
+        if gone:
+            lines.append("")
+            lines.append("提示：已注销的作者会被自动排除在抓取之外；"
+                         "若日后账号恢复，可在设置里配置复查间隔自动重新启用。")
+        QMessageBox.information(self, "账号状态检查", "\n".join(lines))
 
     def open_author_page(self):
         aid = self._selected_author_id()

@@ -1,8 +1,11 @@
 from PySide6.QtCore import QThread, Signal
 
+from ..core.db import DISABLE_REASON_DEACTIVATED
 from ..core.ranking import RankingService
 from ..core.scraper import ScraperEngine, rebuild_md_indexes
 from ..credentials import load_cookie
+from ..pixiv import api
+from ..pixiv.client import PixivClient
 
 
 class ScrapeWorker(QThread):
@@ -112,3 +115,68 @@ class RebuildMdWorker(QThread):
             self.logger.error("索引重建异常：%s", e, exc_info=True)
             report = {"authors": 0, "written": 0, "failed": 0, "error": str(e)}
         self.finished_report.emit(report)
+
+
+class AuthorCheckWorker(QThread):
+    """逐个查询作者账号是否仍然存在（已注销 / 已离开 pixiv）。
+
+    抓取流程为了省请求，只在「没昵称」或「远端零作品」时才查账号主体接口，
+    已注销账号若作品列表仍有返回就会被漏判；这里是用户显式发起的检查，
+    因此对每位目标都查一次，且查不出结论时记为 unknown，绝不默认当成账号正常。
+    """
+
+    progress = Signal(dict)
+    finished_result = Signal(dict)
+
+    def __init__(self, settings, db, logger, targets, parent=None):
+        """targets: [(author_id, kind), ...]，kind 为 novel / illust。"""
+        super().__init__(parent)
+        self.settings = settings
+        self.db = db
+        self.logger = logger
+        self.targets = list(targets)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        result = {"deactivated": [], "alive": [], "renamed": [], "unknown": [], "error": ""}
+        try:
+            cookie = load_cookie()
+            if not cookie:
+                result["error"] = "未配置 Cookie，无法查询账号状态。请先在设置里导入 Cookie。"
+                self.finished_result.emit(result)
+                return
+            client = PixivClient(self.settings, cookie)
+            try:
+                total = len(self.targets)
+                for i, (aid, kind) in enumerate(self.targets):
+                    if self._stop:
+                        break
+                    self.progress.emit({"index": i + 1, "total": total, "author_id": aid})
+                    try:
+                        exists, name = api.get_user_status(client, aid)
+                    except Exception as e:
+                        # 网络 / 风控 / 解析失败都算「未确认」，不冒充「账号正常」
+                        result["unknown"].append({"aid": aid, "kind": kind, "reason": str(e)})
+                        continue
+                    if not exists:
+                        self.db.set_author_enabled(aid, False, kind=kind,
+                                                   reason=DISABLE_REASON_DEACTIVATED)
+                        result["deactivated"].append({"aid": aid, "kind": kind})
+                        continue
+                    if name:
+                        cur = self.db.get_author(aid, kind=kind) or {}
+                        if name != (cur.get("author_name") or ""):
+                            self.db.update_author_name(aid, name)
+                            result["renamed"].append(
+                                {"aid": aid, "kind": kind,
+                                 "old": cur.get("author_name") or "", "name": name})
+                            continue
+                    result["alive"].append({"aid": aid, "kind": kind})
+            finally:
+                client.close()
+        except Exception as e:
+            result["error"] = str(e)
+        self.finished_result.emit(result)

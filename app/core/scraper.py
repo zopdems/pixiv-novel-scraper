@@ -217,7 +217,12 @@ class ScraperEngine:
         except AuthExpiredError:
             raise
         except Exception as e:
-            self.logger.warning("作者 %s 账号状态检查失败（按正常处理）：%s", aid, e)
+            # 查不到结论时本轮仍按正常处理（不误伤），但必须说清楚这类作者
+            # 有可能已注销而没被发现；要确认就到作者管理页点「检查账号状态」。
+            self.logger.warning(
+                "作者 %s 账号状态检查失败（网络 / 风控 / 解析异常），本轮按正常处理：%s。"
+                "若该账号其实已注销，这里会漏判，可在作者管理页点「检查账号状态」复核",
+                aid, e)
             return True
         if not exists:
             self._handle_author_missing(aid, author, kind)
