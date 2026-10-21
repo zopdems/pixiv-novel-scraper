@@ -2,12 +2,12 @@ import os
 import re
 
 from PySide6.QtCore import Qt, QTime
-from PySide6.QtGui import QColor, QKeySequence, QShortcut
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QMenu, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSpinBox, QDoubleSpinBox, QStackedWidget, QTableWidget,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSpinBox, QDoubleSpinBox, QStackedWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QTimeEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -28,44 +28,9 @@ from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
 from .icons import app_mark, icon
 from .ranking_page import RankingPageMixin
 from .theme import apply_theme, current_mode, resolve_mode, tokens
-from .widgets import (ChipRail, LogDrawer, MetricTile, SegmentedControl,
-                      dot, hairline, set_dot)
 from .worker import RebuildMdWorker, ScrapeWorker
 
 _AUTHOR_ID_RE = re.compile(r"^\d+$")
-
-# 主页面在 QStackedWidget 里的顺序（与 _build_*_page 的添加顺序一致）。
-# 之前各处直接写数字索引，导致「跳到设置页」实际跳到了排行榜页。
-PAGE_AUTHORS, PAGE_TASKS, PAGE_SEARCH, PAGE_RANKING, PAGE_SETTINGS = range(5)
-
-# 一级导航：(文案, 图标名)。文案与图标写在一起，避免两处列表长度不一致导致图标错位
-# （历史 bug：设置子导航有 10 项，却只传了 6 个图标，前 6 项全部错配）。
-MAIN_SECTIONS = [
-    ("作者", "users"),
-    ("任务", "activity"),
-    ("检索", "search"),
-    ("排行", "gauge"),
-    ("设置", "sliders"),
-]
-
-# 设置页小节：(文案, 图标名, 一句话说明)。新版是一条连续滚动的长文档，
-# 胶囊条只负责定位，说明文字放在小节标题下面。
-SETTINGS_SECTIONS = [
-    ("外观", "palette", "主题立即生效并自动保存"),
-    ("存储路径", "folder", "EPUB / Markdown / 图片的落盘位置"),
-    ("抓取策略", "gauge", "触发时机、请求频率与过滤规则"),
-    ("文件输出", "file-text", "目录结构、文件命名与 Markdown 索引"),
-    ("内容编排", "book", "EPUB 内的信息页、封面与章节"),
-    ("更新策略", "refresh", "何时重新生成，远端删除如何处理"),
-    ("网络", "globe", "User-Agent 与代理"),
-    ("登录 Cookie", "key", "凭据只存本机；导出备份时明文包含"),
-    ("系统", "database", "开机自启、备份与配置迁移"),
-    ("排行榜", "activity", "榜单抓取的开关、范围与记录方式"),
-]
-
-# 命令栏响应式断点：窄屏优先保证「导航 + 主操作」
-_BREAK_TITLE = 920      # 低于此宽度隐藏品牌名
-_BREAK_SEARCH = 1020    # 低于此宽度隐藏命令栏搜索（检索页仍有完整搜索）
 
 
 def _set_class(widget, cls: str):
@@ -147,10 +112,9 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.on_theme_changed = None
 
         self.setWindowTitle("Pixiv 小说抓取器")
-        # 初始尺寸按屏幕可用区域算：1366×768 在 125% 缩放下逻辑高度只有 ~614，
-        # 写死 1140×740 会超出可视区。最小尺寸也同步下调，保证小屏不被裁切。
-        self.setMinimumSize(880, 560)
-        self._fit_to_screen()
+        self.resize(1140, 740)
+        # 最小尺寸别给太小：高 DPI 缩放下内容需要更多像素，太窄会挤到文字显示不全
+        self.setMinimumSize(1024, 660)
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -158,22 +122,17 @@ class MainWindow(QMainWindow, RankingPageMixin):
         root.setSpacing(0)
         self.setCentralWidget(central)
 
-        # 命令栏在最上，内容区全幅铺满，状态与日志收在底部。
-        # 旧版是「顶栏 + 左侧导航 + 内容卡片」，导航占了固定 186px 且把层级压深一层。
-        root.addWidget(self._build_commandbar())
+        root.addWidget(self._build_topbar())
 
-        # 抽屉要先建：排行榜页初始化时会把自己的日志挂到 drawer 的第 2 个视图上
-        self.drawer = LogDrawer(["抓取日志", "榜单日志"])
-        self.progress_view = self.drawer.view(0)
-        self.rank_log_view = self.drawer.view(1)
-        self.drawer.btn_clear.clicked.connect(self._clear_current_log)
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(14, 12, 14, 12)
+        body_layout.setSpacing(12)
 
         self.stack = QStackedWidget()
-        self.stack.setObjectName("content")
-        root.addWidget(self.stack, 1)
-
-        root.addWidget(self._build_dock())
-        root.addWidget(self.drawer)
+        body_layout.addWidget(self._build_sidebar())
+        body_layout.addWidget(self.stack, 1)
+        root.addWidget(body, 1)
 
         self.stack.addWidget(self._build_authors_page())
         self.stack.addWidget(self._build_tasks_page())
@@ -181,81 +140,50 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.stack.addWidget(self._build_ranking_page())
         self.stack.addWidget(self._build_settings_page())
 
-        self._bind_shortcuts()
+        self.stat_label = QLabel("")
+        sb = self.statusBar()
+        sb.setSizeGripEnabled(False)
+        sb.addPermanentWidget(self.stat_label)
 
-        self.nav.setCurrentIndex(0)
-        self.nav.indexChanged.connect(self.stack.setCurrentIndex)
+        self.nav.setCurrentRow(0)
+        self.nav.currentRowChanged.connect(lambda _i: self._decorate())
+        self.settings_nav.currentRowChanged.connect(lambda _i: self._decorate())
+
         self.refresh_authors()
         self.refresh_failed()
         self._refresh_conn_badge()
         self._decorate()
-        self._apply_responsive()
 
     # ================================================================ 骨架
-    def _fit_to_screen(self):
-        """按屏幕可用区域决定初始尺寸。
-
-        首选 1140×740，但不超过可用区域的 92%，避免在高缩放比 / 小屏笔记本上
-        窗口底部被任务栏遮住或右侧溢出。
-        """
-        w, h = 1140, 740
-        try:
-            from PySide6.QtWidgets import QApplication
-            scr = QApplication.primaryScreen() or self.screen()
-            avail = scr.availableGeometry() if scr else None
-        except Exception:
-            avail = None
-        if avail is not None and avail.width() > 0 and avail.height() > 0:
-            w = max(880, min(w, int(avail.width() * 0.92)))
-            h = max(560, min(h, int(avail.height() * 0.92)))
-        self.resize(w, h)
-
-    def _build_commandbar(self) -> QFrame:
-        """顶部命令栏：品牌 + 一级分段导航 + 全局搜索 + 主操作。
-
-        把「立即抓取」提到命令栏，任何页面都能一键开始，不用先切到任务页。
-        """
+    def _build_topbar(self) -> QFrame:
         bar = QFrame()
-        bar.setObjectName("commandbar")
-        bar.setFixedHeight(tokens(current_mode())["topbar_h"])
+        bar.setObjectName("topbar")
+        bar.setFixedHeight(62)
         h = QHBoxLayout(bar)
-        h.setContentsMargins(16, 0, 16, 0)
-        h.setSpacing(10)
+        h.setContentsMargins(18, 0, 18, 0)
+        h.setSpacing(12)
 
         mark = QLabel()
-        mark.setPixmap(app_mark(28))
-        mark.setFixedSize(28, 28)
+        mark.setPixmap(app_mark(34))
+        mark.setFixedSize(34, 34)
         h.addWidget(mark)
 
-        self.brand_label = QLabel("Pixiv 小说抓取器")
-        self.brand_label.setProperty("class", "brand")
-        h.addWidget(self.brand_label)
-
-        # 一级导航：横向分段控件，取代旧版左侧 QListWidget
-        self.nav = SegmentedControl([lb for lb, _ic in MAIN_SECTIONS])
-        h.addWidget(self.nav)
+        title = QLabel("Pixiv 小说抓取器")
+        title.setProperty("class", "page-title")
+        title.setStyleSheet("font-size: 15px;")
+        subtitle = QLabel("小说 / 插画 本地同步")
+        subtitle.setProperty("class", "page-sub")
+        tv = QVBoxLayout()
+        tv.setSpacing(1)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.addWidget(title)
+        tv.addWidget(subtitle)
+        h.addLayout(tv)
         h.addStretch(1)
 
-        # 全局搜索：回车直接跳到检索页并出结果，省掉「切页 → 找输入框」两步
-        self.global_search = QLineEdit()
-        self.global_search.setProperty("class", "globalsearch")
-        self.global_search.setPlaceholderText("搜索本地作品…")
-        self.global_search.setFixedWidth(168)
-        self.global_search.returnPressed.connect(self._run_global_search)
-        h.addWidget(self.global_search)
-
-        self.btn_run = QPushButton("立即抓取")
-        self.btn_run.setProperty("class", "primary")
-        self.btn_run.setToolTip("按当前名单立刻跑一轮同步（Ctrl+Shift+F）")
-        self.btn_run.clicked.connect(self.start_fetch)
-        h.addWidget(self.btn_run)
-
-        self.btn_stop = QPushButton("中止")
-        self.btn_stop.setProperty("class", "danger")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.setVisible(False)
-        self.btn_stop.clicked.connect(self.stop_fetch)
-        h.addWidget(self.btn_stop)
+        self.conn_badge = QLabel("")
+        self.conn_badge.setProperty("class", "badge-idle")
+        h.addWidget(self.conn_badge)
 
         self.btn_theme = QPushButton()
         self.btn_theme.setProperty("class", "icon")
@@ -263,120 +191,57 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.btn_theme.clicked.connect(self._toggle_theme)
         h.addWidget(self.btn_theme)
 
-        btn_hide = QPushButton("隐藏")
+        btn_hide = QPushButton("隐藏到托盘")
         btn_hide.setProperty("class", "ghost")
-        btn_hide.setToolTip("最小化到系统托盘，后台继续按计划运行")
         btn_hide.clicked.connect(self.hide)
         h.addWidget(btn_hide)
         return bar
 
-    def _build_dock(self) -> QFrame:
-        """底部状态栏：连接状态 + 运行状态 + 上次结果 + 待处理 + 日志入口。
+    def _build_sidebar(self) -> QFrame:
+        side = QFrame()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(186)
+        v = QVBoxLayout(side)
+        v.setContentsMargins(6, 10, 6, 10)
+        v.setSpacing(4)
 
-        旧版这些信息一部分在顶栏徽标、一部分在任务页卡片里、一部分在 QStatusBar，
-        现在统一收在一处，任何页面都能看到。
-        """
-        dock = QFrame()
-        dock.setObjectName("dock")
-        dock.setFixedHeight(tokens(current_mode())["dock_h"])
-        h = QHBoxLayout(dock)
-        h.setContentsMargins(16, 0, 16, 0)
-        h.setSpacing(10)
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        for name in ["作者", "任务", "检索", "排行", "设置"]:
+            self.nav.addItem(name)
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        v.addWidget(self.nav, 1)
 
-        self.conn_dot = dot("idle")
-        h.addWidget(self.conn_dot)
-        self.conn_label = QLabel("未配置 Cookie")
-        self.conn_label.setProperty("class", "dock")
-        h.addWidget(self.conn_label)
+        tip = QLabel("关闭窗口只会隐藏到系统托盘\n完全退出请在托盘菜单中选择")
+        tip.setProperty("class", "hint")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+        return side
 
-        self.btn_cookie_fix = QPushButton("去配置")
-        self.btn_cookie_fix.setProperty("class", "ghost")
-        self.btn_cookie_fix.setToolTip("前往「设置 → 登录 Cookie」导入 Cookie")
-        self.btn_cookie_fix.clicked.connect(lambda: self.open_settings_section("登录 Cookie"))
-        h.addWidget(self.btn_cookie_fix)
+    @staticmethod
+    def _wrap_layout(layout) -> QWidget:
+        """把布局包成 QWidget，便于放进 QFormLayout 的某一行。"""
+        w = QWidget()
+        l = QHBoxLayout(w)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addLayout(layout)
+        return w
 
-        h.addStretch(1)
+    def _card(self, margin=14, spacing=10):
+        frame = QFrame()
+        frame.setProperty("class", "card")
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(margin, margin, margin, margin)
+        lay.setSpacing(spacing)
+        return frame, lay
 
-        self.run_status = QLabel("就绪")
-        self.run_status.setProperty("class", "badge-idle")
-        h.addWidget(self.run_status)
-
-        self.busy = QProgressBar()
-        self.busy.setRange(0, 0)
-        self.busy.setFixedWidth(70)
-        self.busy.setTextVisible(False)
-        self.busy.setVisible(False)
-        h.addWidget(self.busy)
-
-        self.dock_last = QLabel("尚未执行过抓取")
-        self.dock_last.setProperty("class", "dock")
-        h.addWidget(self.dock_last)
-
-        self.dock_pending = QLabel("")
-        self.dock_pending.setProperty("class", "dock")
-        h.addWidget(self.dock_pending)
-
-        self.btn_log = QPushButton("日志")
-        self.btn_log.setProperty("class", "ghost")
-        self.btn_log.setToolTip("展开 / 收起底部日志（Ctrl+L）")
-        self.btn_log.clicked.connect(self.drawer.toggle)
-        h.addWidget(self.btn_log)
-        return dock
-
-    def _clear_current_log(self):
-        view = self.drawer.view(self.drawer.tabs.currentIndex())
-        if view is not None:
-            view.clear()
-
-    def _bind_shortcuts(self):
-        """键盘直达：一级导航 Ctrl+1~5，搜索 Ctrl+K，日志 Ctrl+L。"""
-        for i in range(min(5, len(MAIN_SECTIONS))):
-            sc = QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self)
-            sc.activated.connect(lambda idx=i: self.nav.setCurrentIndex(idx))
-        sc_search = QShortcut(QKeySequence("Ctrl+K"), self)
-        sc_search.activated.connect(self._focus_global_search)
-        sc_log = QShortcut(QKeySequence("Ctrl+L"), self)
-        sc_log.activated.connect(self.drawer.toggle)
-        sc_fetch = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
-        sc_fetch.activated.connect(self.start_fetch)
-
-    def _focus_global_search(self):
-        self.nav.setCurrentIndex(PAGE_SEARCH)
-        self.search_input.setFocus()
-        self.search_input.selectAll()
-
-    def _run_global_search(self):
-        kw = self.global_search.text().strip()
-        if not kw:
-            return
-        self.nav.setCurrentIndex(PAGE_SEARCH)
-        self.search_input.setText(kw)
-        self.do_search()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._apply_responsive()
-
-    def _apply_responsive(self):
-        """窄屏下按优先级裁剪命令栏内容：导航与主操作永远保留。"""
-        w = self.width()
-        self.brand_label.setVisible(w >= _BREAK_TITLE)
-        show_search = w >= _BREAK_SEARCH
-        self.global_search.setVisible(show_search)
-
-    # -------------------------------------------------------- 页面骨架工具
     def _page(self, title: str, subtitle: str):
-        """页面外壳：标题区（含右侧操作位）+ 一条发丝线。
-
-        返回 (页面, 外层纵向布局, 标题行布局)，标题行可继续塞按钮。
-        """
         w = QWidget()
         outer = QVBoxLayout(w)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(4, 0, 4, 14)
+        outer.setSpacing(12)
 
         head = QHBoxLayout()
-        head.setContentsMargins(20, 16, 20, 12)
         head.setSpacing(10)
         t = QLabel(title)
         t.setProperty("class", "page-title")
@@ -390,64 +255,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         head.addLayout(tv)
         head.addStretch(1)
         outer.addLayout(head)
-        outer.addWidget(hairline())
         return w, outer, head
-
-    def _block(self, outer, vertical=False, pad=(20, 10)):
-        """往页面里追加一个分区（工具条 / 指标行），下面补一条发丝线。
-
-        重构后不再用「浮起的圆角卡片」分区，而是靠留白 + 发丝线，
-        页面因此可以从上到下连续阅读，也不会出现卡片之间的双重描边。
-        """
-        w = QWidget()
-        lay = QVBoxLayout(w) if vertical else QHBoxLayout(w)
-        lay.setContentsMargins(pad[0], pad[1], pad[0], pad[1])
-        lay.setSpacing(8)
-        outer.addWidget(w)
-        outer.addWidget(hairline())
-        return lay
-
-    def _section_bar(self, outer, title: str):
-        """分区标题行：左侧标题 + 右侧操作位，下面补一条发丝线。"""
-        lay = self._block(outer, pad=(20, 8))
-        lab = QLabel(title)
-        lab.setProperty("class", "section-title")
-        lay.addWidget(lab)
-        lay.addSpacing(4)
-        lay.addStretch(1)
-        return lay
-
-    # ------------------------------------------------------------ 行菜单
-    def _attach_row_menu(self, table: QTableWidget, actions: list):
-        """给表格行挂右键菜单，省掉「选中行 → 把鼠标移到卡片顶部按钮」这一段路径。
-
-        actions: [(菜单文案, 回调)]。回调执行前会先把光标所在行设为当前行，
-        因此回调可以直接复用原有的「作用于选中行」逻辑，不需要改任何业务代码。
-        """
-        table.setContextMenuPolicy(Qt.CustomContextMenu)
-        table.customContextMenuRequested.connect(
-            lambda pos, t=table, a=actions: self._show_row_menu(t, a, pos))
-
-    def _show_row_menu(self, table: QTableWidget, actions: list, pos):
-        row = table.rowAt(pos.y())
-        if row < 0:
-            return
-        if row != table.currentRow():
-            table.selectRow(row)
-        menu = QMenu(self)
-        for label, callback in actions:
-            act = menu.addAction(label)
-            act.triggered.connect(lambda _checked=False, fn=callback: fn())
-        menu.exec(table.viewport().mapToGlobal(pos))
-
-    @staticmethod
-    def _wrap_layout(layout) -> QWidget:
-        """把布局包成 QWidget，便于放进 QFormLayout 的某一行。"""
-        w = QWidget()
-        l = QHBoxLayout(w)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.addLayout(layout)
-        return w
 
     # ================================================================ 作者
     def _make_author_table(self, headers: list) -> QTableWidget:
@@ -462,32 +270,20 @@ class MainWindow(QMainWindow, RankingPageMixin):
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
-        table.verticalHeader().setDefaultSectionSize(tokens(current_mode())["row_h"])
+        table.verticalHeader().setDefaultSectionSize(38)
         table.setShowGrid(True)
         table.setSortingEnabled(True)
         table.cellDoubleClicked.connect(self._on_author_cell_double_clicked)
-        # 常用操作直接右键，不必回到上方按钮区
-        self._attach_row_menu(table, [
-            ("打开 Pixiv 主页", self.open_author_page),
-            ("启用 / 停用", self.toggle_author),
-            ("从名单删除", self.delete_author),
-        ])
         return table
 
     def _build_authors_page(self):
         page, outer, _head = self._page(
             "作者管理", "维护需要同步的小说 / 插画作者名单，双击昵称可打开 Pixiv 主页")
 
-        # 指标行：不进表格也能判断「现在什么状态」
-        self.m_authors = MetricTile("名单作者")
-        self.m_works = MetricTile("已收录作品")
-        self.m_deleted = MetricTile("远端已删除")
-        self.m_failed = MetricTile("待处理")
-        mrow = self._block(outer, pad=(20, 12))
-        for tile in (self.m_authors, self.m_works, self.m_deleted, self.m_failed):
-            mrow.addWidget(tile)
+        bar, bl = self._card(margin=12, spacing=8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
 
-        bar = self._block(outer)
         self.author_input = QLineEdit()
         self.author_input.setPlaceholderText("作者数字 ID，或粘贴 pixiv.net/users/… 主页链接")
         self.author_input.returnPressed.connect(self.add_author)
@@ -497,13 +293,12 @@ class MainWindow(QMainWindow, RankingPageMixin):
         btn_add.setProperty("class", "primary")
         btn_add.clicked.connect(self.add_author)
         btn_batch = QPushButton("批量导入")
-        btn_batch.setProperty("class", "subtle")
         btn_batch.clicked.connect(self.batch_import)
 
-        bar.addWidget(self.author_input)
-        bar.addWidget(btn_add)
-        bar.addWidget(btn_batch)
-        bar.addStretch(1)
+        row.addWidget(self.author_input)
+        row.addWidget(btn_add)
+        row.addWidget(btn_batch)
+        row.addStretch(1)
 
         self.btn_rebuild_md = QPushButton("重建索引")
         self.btn_rebuild_md.setToolTip("按当前设置重新生成全部作者的 Markdown 索引（不联网、不重新下载作品）")
@@ -516,29 +311,26 @@ class MainWindow(QMainWindow, RankingPageMixin):
         btn_del = QPushButton("删除")
         btn_del.setProperty("class", "danger")
         btn_del.clicked.connect(self.delete_author)
-        bar.addWidget(self.btn_rebuild_md)
-        bar.addWidget(btn_open)
-        bar.addWidget(btn_toggle)
-        bar.addWidget(btn_del)
+        row.addWidget(self.btn_rebuild_md)
+        row.addWidget(btn_open)
+        row.addWidget(btn_toggle)
+        row.addWidget(btn_del)
+        bl.addLayout(row)
+        outer.addWidget(bar)
 
-        # 二级切换也用分段控件，取代 QTabWidget
-        sub = self._block(outer, pad=(20, 8))
-        self.author_tabs = SegmentedControl(["小说作者", "插画作者", "已删除作品"])
-        sub.addWidget(self.author_tabs)
-        sub.addStretch(1)
-
-        self.author_stack = QStackedWidget()
+        table_card, tl = self._card(margin=12, spacing=8)
+        self.author_tabs = QTabWidget()
         self.novel_author_table = self._make_author_table(
             ["昵称", "作者 ID", "状态", "最近抓取", "已收录小说", "已删单篇", "已删系列"])
         self.illust_author_table = self._make_author_table(
             ["昵称", "作者 ID", "状态", "最近抓取", "已收录插画", "已删插画"])
-        self.author_stack.addWidget(self.novel_author_table)
-        self.author_stack.addWidget(self.illust_author_table)
-        self.author_stack.addWidget(self._build_deleted_works_tab())
+        self.author_tabs.addTab(self.novel_author_table, "小说作者")
+        self.author_tabs.addTab(self.illust_author_table, "插画作者")
+        self.author_tabs.addTab(self._build_deleted_works_tab(), "已删除作品")
         # 每次切到「已删除作品」都重置为收起，不继承上次的展开状态
-        self.author_tabs.indexChanged.connect(self.author_stack.setCurrentIndex)
-        self.author_tabs.indexChanged.connect(self._on_author_tab_changed)
-        outer.addWidget(self.author_stack, 1)
+        self.author_tabs.currentChanged.connect(self._on_author_tab_changed)
+        tl.addWidget(self.author_tabs, 1)
+        outer.addWidget(table_card, 1)
         return page
 
     def _on_author_tab_changed(self, index: int):
@@ -549,7 +341,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         """「已删除作品」标签页：按作者分组列出远端已删除的作品。"""
         w = QWidget()
         v = QVBoxLayout(w)
-        v.setContentsMargins(20, 12, 20, 12)
+        v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(8)
 
         self.deleted_summary = QLabel("")
@@ -615,7 +407,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         if kind is None:
             QMessageBox.information(self, "提示", "请先切换到「小说作者」或「插画作者」标签页再添加。")
             return
-        if self.db.add_author(aid, pending_validate=True, kind=kind):
+        if self.db.add_author(text, pending_validate=True, kind=kind):
             self.author_input.clear()
             self.refresh_authors()
         else:
@@ -856,74 +648,94 @@ class MainWindow(QMainWindow, RankingPageMixin):
         try:
             n = len(self.db.list_authors(kind="novel"))
             m = len(self.db.list_authors(kind="illust"))
-            self.m_authors.set_value(str(n + m))
-            self.m_authors.set_caption(f"小说 {n} 位 · 插画 {m} 位")
-        except Exception:
-            pass
-        self._refresh_overview_tiles()
-
-    def _refresh_overview_tiles(self):
-        """刷新「已收录 / 已删除 / 待处理」三个指标，并同步底部状态栏。"""
-        try:
-            stats = self.db.stats() or {}
-            total = sum(int(v) for v in stats.values())
-            self.m_works.set_value(str(total))
             root = self.settings.epub_root or "未设置"
-            self.m_works.set_caption(f"输出目录：{root}")
-        except Exception:
-            pass
-        try:
-            gone = len(self.db.deleted_novels()) + len(self.db.deleted_illusts())
-            self.m_deleted.set_value(str(gone), "warn" if gone else "")
-            self.m_deleted.set_caption("本地文件均已保留")
-        except Exception:
-            pass
-        try:
-            pending = len(self.db.failed_novels()) + len(self.db.failed_illusts())
-            self.m_failed.set_value(str(pending), "err" if pending else "ok")
-            self.m_failed.set_caption("可在任务页重试或移除" if pending else "没有需要处理的记录")
-            self.dock_pending.setText(f"{pending} 项待处理" if pending else "无待处理")
+            self.stat_label.setText(f"小说作者 {n} 位  ·  插画作者 {m} 位  ·  EPUB：{root}")
         except Exception:
             pass
 
     # ================================================================ 任务
     def _build_tasks_page(self):
-        page, outer, _head = self._page(
-            "任务", "运行日志已收进底部抽屉（Ctrl+L），在任何页面都能看到实时进度")
+        page, outer, _head = self._page("抓取任务", "手动触发一次完整同步，或查看失败 / 远端已删除的作品")
 
-        # 上一次任务的结果用三个数字说话，不再只给一行文字
-        self.t_new = MetricTile("上次新增")
-        self.t_upd = MetricTile("上次更新")
-        self.t_fail = MetricTile("上次失败")
-        self.t_gone = MetricTile("远端已删除")
-        mrow = self._block(outer, pad=(20, 12))
-        for tile in (self.t_new, self.t_upd, self.t_fail, self.t_gone):
-            mrow.addWidget(tile)
+        bar, bl = self._card(margin=12, spacing=8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
 
-        block = self._block(outer, vertical=True)
+        self.btn_run = QPushButton("立即抓取")
+        self.btn_run.setProperty("class", "primary")
+        self.btn_run.clicked.connect(self.start_fetch)
+        self.btn_stop = QPushButton("中止任务")
+        self.btn_stop.setProperty("class", "danger")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_fetch)
+
+        self.run_status = QLabel("就绪")
+        self.run_status.setProperty("class", "badge-idle")
+
+        self.busy = QProgressBar()
+        self.busy.setRange(0, 0)
+        self.busy.setFixedWidth(110)
+        self.busy.setTextVisible(False)
+        self.busy.setVisible(False)
+
+        btn_logs = QPushButton("打开日志目录")
+        btn_logs.clicked.connect(self.open_log_dir)
+
+        row.addWidget(self.btn_run)
+        row.addWidget(self.btn_stop)
+        row.addSpacing(4)
+        row.addWidget(self.run_status)
+        row.addWidget(self.busy)
+        row.addStretch(1)
+        row.addWidget(btn_logs)
+        bl.addLayout(row)
+
         self.last_run_label = QLabel("尚未执行过抓取")
         self.last_run_label.setProperty("class", "hint")
         self.last_run_label.setWordWrap(True)
-        block.addWidget(self.last_run_label)
+        bl.addWidget(self.last_run_label)
+        outer.addWidget(bar)
 
-        bar = self._section_bar(outer, "失败 / 远端已删除")
+        log_card, lc = self._card(margin=12, spacing=8)
+        head = QHBoxLayout()
+        t = QLabel("运行日志")
+        t.setProperty("class", "section-title")
+        head.addWidget(t)
+        head.addStretch(1)
+        btn_clear_log = QPushButton("清空")
+        btn_clear_log.setProperty("class", "ghost")
+        btn_clear_log.clicked.connect(self.progress_view_clear)
+        head.addWidget(btn_clear_log)
+        lc.addLayout(head)
+
+        self.progress_view = QPlainTextEdit()
+        self.progress_view.setProperty("class", "log")
+        self.progress_view.setReadOnly(True)
+        self.progress_view.setMaximumBlockCount(2000)
+        self.progress_view.setPlaceholderText("点击「立即抓取」开始，运行过程会实时显示在这里。")
+        lc.addWidget(self.progress_view, 1)
+        outer.addWidget(log_card, 2)
+
+        fail_card, fc = self._card(margin=12, spacing=8)
+        fhead = QHBoxLayout()
+        ft = QLabel("失败 / 远端已删除")
+        ft.setProperty("class", "section-title")
         self.failed_count = QLabel("")
         self.failed_count.setProperty("class", "hint")
-        bar.addWidget(self.failed_count)
+        fhead.addWidget(ft)
+        fhead.addWidget(self.failed_count)
+        fhead.addStretch(1)
         btn_retry_one = QPushButton("重新抓取")
-        btn_retry_one.setProperty("class", "subtle")
+        btn_retry_one.setProperty("class", "ghost")
         btn_retry_one.setToolTip("把选中项重置为「待下载」，下一轮抓取会重新尝试")
         btn_retry_one.clicked.connect(self.retry_selected_item)
         btn_drop_one = QPushButton("移除记录")
-        btn_drop_one.setProperty("class", "subtle")
+        btn_drop_one.setProperty("class", "ghost")
         btn_drop_one.setToolTip("仅从本列表移除索引记录，本地已下载的文件不会被删除")
         btn_drop_one.clicked.connect(self.remove_selected_item)
-        btn_logs = QPushButton("打开日志目录")
-        btn_logs.setProperty("class", "ghost")
-        btn_logs.clicked.connect(self.open_log_dir)
-        bar.addWidget(btn_retry_one)
-        bar.addWidget(btn_drop_one)
-        bar.addWidget(btn_logs)
+        fhead.addWidget(btn_retry_one)
+        fhead.addWidget(btn_drop_one)
+        fc.addLayout(fhead)
 
         self.failed_table = QTableWidget(0, 4)
         self.failed_table.setHorizontalHeaderLabels(["作品 ID", "标题", "说明", "状态"])
@@ -931,13 +743,10 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.failed_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.failed_table.setAlternatingRowColors(True)
         self.failed_table.verticalHeader().setVisible(False)
-        self.failed_table.verticalHeader().setDefaultSectionSize(tokens(current_mode())["row_h"])
+        self.failed_table.verticalHeader().setDefaultSectionSize(34)
         self.failed_table.setShowGrid(False)
-        self._attach_row_menu(self.failed_table, [
-            ("重试这一条", self.retry_selected_item),
-            ("从列表移除", self.remove_selected_item),
-        ])
-        outer.addWidget(self.failed_table, 1)
+        fc.addWidget(self.failed_table, 1)
+        outer.addWidget(fail_card, 1)
         return page
 
     def progress_view_clear(self):
@@ -952,15 +761,9 @@ class MainWindow(QMainWindow, RankingPageMixin):
             return
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.btn_stop.setVisible(True)
         self.busy.setVisible(True)
         _set_class(self.run_status, "badge")
         self.run_status.setText("抓取中…")
-        set_dot(self.conn_dot, "run")
-        # 任务一开始就把日志抽屉展开，进度不用再去任务页找
-        if not self.drawer.is_expanded():
-            self.drawer.set_expanded(True)
-        self.drawer.tabs.setCurrentIndex(0)
         self.progress_view.appendPlainText("=== 任务开始 ===")
         self.worker = ScrapeWorker(self.settings, self.db, self.logger, self)
         self.worker.progress.connect(self.on_progress)
@@ -1005,7 +808,6 @@ class MainWindow(QMainWindow, RankingPageMixin):
     def on_finished(self, report):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.btn_stop.setVisible(False)
         self.busy.setVisible(False)
         failed = getattr(report, "failed_count", 0)
         if getattr(report, "aborted_reason", None):
@@ -1017,7 +819,6 @@ class MainWindow(QMainWindow, RankingPageMixin):
         else:
             _set_class(self.run_status, "badge-ok")
             self.run_status.setText("已完成")
-        self._refresh_conn_badge()
 
         summary = (
             f"=== 任务结束：小说 新增 {report.new_count}，更新 {report.updated_count}，"
@@ -1036,11 +837,10 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self._update_last_run_label()
         self.refresh_authors()
         self.refresh_failed()
-        self._refresh_task_tiles(report)
         if getattr(report, "auth_expired", False):
             # 登录失效：切换连接徽标为警告态，并明确提示需要重新导入 Cookie
-            self.conn_label.setText("Cookie 已失效")
-            set_dot(self.conn_dot, "err")
+            _set_class(self.conn_badge, "badge-warn")
+            self.conn_badge.setText("Cookie 已失效")
         if self.on_fetch_done:
             self.on_fetch_done(report)
 
@@ -1049,34 +849,21 @@ class MainWindow(QMainWindow, RankingPageMixin):
         report = getattr(self, "last_report", None)
         if report is None:
             self.last_run_label.setText("尚未执行过抓取")
-            self.dock_last.setText("尚未执行过抓取")
             return
         when = (getattr(report, "finished_at", "") or getattr(report, "started_at", "") or "")[:16]
         if getattr(report, "auth_expired", False):
             self.last_run_label.setText(f"上次任务 {when}：登录已失效，任务中止，请重新导入 Cookie")
             _set_class(self.last_run_label, "status-err")
-            self.dock_last.setText(f"上次 {when}：登录已失效")
             return
         if getattr(report, "aborted_reason", ""):
             self.last_run_label.setText(f"上次任务 {when}：已中止 — {report.aborted_reason}")
             _set_class(self.last_run_label, "status-err")
-            self.dock_last.setText(f"上次 {when}：已中止")
             return
         failed = getattr(report, "failed_count", 0) + getattr(report, "illust_failed", 0)
         text = (f"上次任务 {when}：新增 {report.new_count} / 更新 {report.updated_count} / "
                 f"跳过 {report.skipped_count} / 失败 {failed} / 远端删除 {report.deleted_count}")
         _set_class(self.last_run_label, "status-err" if failed else "status-ok")
         self.last_run_label.setText(text)
-        self.dock_last.setText(f"上次 {when} · 新增 {report.new_count}")
-
-    def _refresh_task_tiles(self, report):
-        self.t_new.set_value(str(getattr(report, "new_count", 0)),
-                             "ok" if getattr(report, "new_count", 0) else "")
-        self.t_upd.set_value(str(getattr(report, "updated_count", 0)))
-        self.t_fail.set_value(str(getattr(report, "failed_count", 0) + getattr(report, "illust_failed", 0)),
-                              "err" if (getattr(report, "failed_count", 0) + getattr(report, "illust_failed", 0)) else "ok")
-        gone = getattr(report, "deleted_count", 0) + getattr(report, "illust_deleted", 0)
-        self.t_gone.set_value(str(gone), "warn" if gone else "")
 
     def refresh_failed(self):
         rows = [
@@ -1110,7 +897,6 @@ class MainWindow(QMainWindow, RankingPageMixin):
                 self.failed_table.setItem(i, c, item)
         self.failed_table.setSortingEnabled(True)
         self.failed_count.setText(f"共 {len(rows)} 条" if rows else "暂无记录")
-        self._refresh_overview_tiles()
 
     def _selected_failed_item(self):
         """返回 (kind, work_id)；未选中时返回 (None, None)。"""
@@ -1154,10 +940,11 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
     # ================================================================ 检索
     def _build_search_page(self):
-        page, outer, _head = self._page(
-            "检索", "按标题 / 作者昵称 / 标签在本地库中查找已抓取的作品；命令栏搜索框也可直达")
+        page, outer, _head = self._page("检索", "按标题 / 作者昵称 / 标签在本地库中查找已抓取的作品")
 
-        bar = self._block(outer)
+        bar, bl = self._card(margin=12, spacing=8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
         self.search_input = QLineEdit()
         self.search_input.setProperty("class", "search")
         self.search_input.setPlaceholderText("按标题 / 作者昵称 / 标签搜索，回车开始")
@@ -1165,31 +952,39 @@ class MainWindow(QMainWindow, RankingPageMixin):
         btn = QPushButton("搜索")
         btn.setProperty("class", "primary")
         btn.clicked.connect(self.do_search)
-        bar.addWidget(self.search_input, 1)
-        bar.addWidget(btn)
+        row.addWidget(self.search_input, 1)
+        row.addWidget(btn)
 
         self.search_type = QComboBox()
         self.search_type.addItem("全部类型", "")
         self.search_type.addItem("小说", "novel")
         self.search_type.addItem("插画 / 漫画", "illust")
         self.search_type.currentIndexChanged.connect(self.do_search)
-        bar.addWidget(self.search_type)
+        row.addWidget(self.search_type)
 
         self.search_status = QComboBox()
         self.search_status.addItem("全部状态", "")
         for value, label in STATUS_LABELS.items():
             self.search_status.addItem(label, value)
         self.search_status.currentIndexChanged.connect(self.do_search)
-        bar.addWidget(self.search_status)
+        row.addWidget(self.search_status)
+        bl.addLayout(row)
+        outer.addWidget(bar)
 
-        head = self._section_bar(outer, "搜索结果")
+        res_card, rc = self._card(margin=12, spacing=8)
+        rhead = QHBoxLayout()
+        rt = QLabel("搜索结果")
+        rt.setProperty("class", "section-title")
         self.search_count = QLabel("")
         self.search_count.setProperty("class", "hint")
-        head.addWidget(self.search_count)
+        rhead.addWidget(rt)
+        rhead.addWidget(self.search_count)
+        rhead.addStretch(1)
         btn_refresh = QPushButton("刷新")
-        btn_refresh.setProperty("class", "subtle")
+        btn_refresh.setProperty("class", "ghost")
         btn_refresh.clicked.connect(self.do_search)
-        head.addWidget(btn_refresh)
+        rhead.addWidget(btn_refresh)
+        rc.addLayout(rhead)
 
         self.search_table = QTableWidget(0, 5)
         self.search_table.setHorizontalHeaderLabels(["标题", "类型", "作者", "状态", "本地路径"])
@@ -1202,18 +997,15 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.search_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.search_table.setAlternatingRowColors(True)
         self.search_table.verticalHeader().setVisible(False)
-        self.search_table.verticalHeader().setDefaultSectionSize(tokens(current_mode())["row_h"])
+        self.search_table.verticalHeader().setDefaultSectionSize(36)
         self.search_table.setShowGrid(False)
         self.search_table.doubleClicked.connect(self.open_novel_dir)
-        self._attach_row_menu(self.search_table, [
-            ("打开所在目录", self.open_novel_dir),
-        ])
-        outer.addWidget(self.search_table, 1)
+        rc.addWidget(self.search_table, 1)
+        outer.addWidget(res_card, 1)
 
         hint = QLabel("双击任意一行可打开该作品所在的目录")
         hint.setProperty("class", "hint")
-        foot = self._block(outer, pad=(20, 8))
-        foot.addWidget(hint)
+        outer.addWidget(hint)
         return page
 
     def do_search(self):
@@ -1254,8 +1046,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
     # ================================================================ 设置
     def _build_settings_page(self):
-        page, outer, head = self._page(
-            "设置", "所有选项按小节连续排列，用下面的胶囊条直接跳转；改动后点「保存设置」")
+        page, outer, head = self._page("设置", "存储位置、抓取策略、网络与登录凭据")
 
         btn_save = QPushButton("保存设置")
         btn_save.setProperty("class", "primary")
@@ -1267,53 +1058,44 @@ class MainWindow(QMainWindow, RankingPageMixin):
         btn_reset.clicked.connect(self.reset_advanced)
         head.addWidget(btn_reset)
 
-        # 旧版是「左侧 10 项子导航 + 右侧 10 个堆叠页」，切换即换页、看不到全貌。
-        # 新版是一份连续滚动的长文档，胶囊条只做定位，滚动时自动回写当前小节。
-        self.settings_rail = ChipRail([lb for lb, *_ in SETTINGS_SECTIONS])
-        outer.addWidget(self.settings_rail)
-        outer.addWidget(hairline())
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        outer.addLayout(body, 1)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        col = QWidget()
-        self.settings_col = QVBoxLayout(col)
-        self.settings_col.setContentsMargins(0, 0, 0, 0)
-        self.settings_col.setSpacing(0)
-        self.settings_col.addStretch(1)
-        scroll.setWidget(col)
-        outer.addWidget(scroll, 1)
-        self.settings_scroll = scroll
-        self._settings_groups = []
-        self._rail_guard = False
-        self.settings_rail.indexChanged.connect(self._scroll_to_settings_group)
-        scroll.verticalScrollBar().valueChanged.connect(self._sync_settings_rail)
+        nav_card, nc = self._card(margin=8, spacing=4)
+        nav_card.setFixedWidth(172)
+        self.settings_nav = QListWidget()
+        self.settings_nav.setObjectName("subnav")
+        self.settings_nav.addItems([
+            "外观", "存储路径", "抓取策略", "文件输出", "内容编排", "更新策略",
+            "网络", "登录 Cookie", "系统", "排行榜",
+        ])
+        nc.addWidget(self.settings_nav)
+        body.addWidget(nav_card)
 
-        def make_group(title: str, caption: str = "") -> QFormLayout:
-            """追加一个小节（标题 + 说明 + 表单），返回表单布局。"""
-            gw = QWidget()
-            gl = QVBoxLayout(gw)
-            gl.setContentsMargins(20, 14, 20, 14)
-            gl.setSpacing(6)
-            lab = QLabel(title)
-            lab.setProperty("class", "group-title")
-            gl.addWidget(lab)
-            if caption:
-                cap = QLabel(caption)
-                cap.setProperty("class", "hint")
-                cap.setWordWrap(True)
-                gl.addWidget(cap)
-            form = QFormLayout()
-            form.setSpacing(10)
-            form.setHorizontalSpacing(16)
-            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            gl.addLayout(form)
+        self.settings_stack = QStackedWidget()
+        body.addWidget(self.settings_stack, 1)
+        self.settings_nav.currentRowChanged.connect(self.settings_stack.setCurrentIndex)
 
-            pos = len(self._settings_groups) * 2
-            self.settings_col.insertWidget(pos, gw)
-            self.settings_col.insertWidget(pos + 1, hairline())
-            self._settings_groups.append(gw)
-            return form
+        def make_page() -> QFormLayout:
+            w = QWidget()
+            outer_l = QVBoxLayout(w)
+            outer_l.setContentsMargins(0, 0, 0, 0)
+            outer_l.setSpacing(0)
+            card, cl = self._card(margin=16, spacing=12)
+            f = QFormLayout()
+            f.setSpacing(12)
+            f.setHorizontalSpacing(16)
+            f.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            cl.addLayout(f)
+            outer_l.addWidget(card)
+            outer_l.addStretch(1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(w)
+            self.settings_stack.addWidget(scroll)
+            return f
 
         def section(form: QFormLayout, text: str) -> QLabel:
             lab = QLabel(text)
@@ -1339,7 +1121,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         s = self.settings
 
         # ---- 外观 ----
-        form = make_group("外观", "主题立即生效并自动保存")
+        form = make_page()
         self.theme_combo = QComboBox()
         for label, value in [("浅色", "light"), ("深色", "dark"), ("跟随系统", "auto")]:
             self.theme_combo.addItem(label, value)
@@ -1347,10 +1129,14 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.theme_combo.currentIndexChanged.connect(self._on_theme_combo_changed)
         form.addRow("主题", self.theme_combo)
-        hint(form, "也可以点命令栏右侧的月亮 / 太阳图标快速切换。")
+
+        appearance_hint = QLabel(
+            "切换立即生效并自动保存；也可以点击右上角的月亮 / 太阳图标快速切换。")
+        appearance_hint.setProperty("class", "hint")
+        form.addRow("", appearance_hint)
 
         # ---- 存储路径 ----
-        form = make_group("存储路径", "EPUB / Markdown / 图片的落盘位置")
+        form = make_page()
         self.set_epub = QLineEdit(s.epub_root)
         btn_epub = QPushButton("浏览…")
         btn_epub.clicked.connect(lambda: self._pick_dir(self.set_epub))
@@ -1391,7 +1177,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         form.addRow("文件命名规则", self.set_pattern)
 
         # ---- 抓取策略 ----
-        form = make_group("抓取策略", "触发时机、请求频率与过滤规则")
+        form = make_page()
         self.set_time = QTimeEdit(QTime.fromString(s.fetch_time, "HH:mm"))
         self.set_time.setDisplayFormat("HH:mm")
         form.addRow("每日抓取时间", self.set_time)
@@ -1477,7 +1263,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         hint(form, "0 = 不限（默认）。仅对小说生效，插画/漫画不受影响。")
 
         # ---- 文件输出 ----
-        form = make_group("文件输出", "目录结构、文件命名与 Markdown 索引")
+        form = make_page()
         section(form, "目录与命名")
         self.set_series_dir = QCheckBox("按「单篇 / 系列」分子目录")
         self.set_series_dir.setChecked(bool(getattr(s, "organize_by_series", True)))
@@ -1525,7 +1311,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         hint(form, "仅影响「单篇」段落的顺序；系列内始终按系列顺序号排序。")
 
         # ---- 内容编排 ----
-        form = make_group("内容编排", "EPUB 内的信息页、封面与章节")
+        form = make_page()
         section(form, "作品信息页")
         self.set_info_page = QCheckBox("生成「作品信息」页")
         self.set_info_page.setChecked(bool(getattr(s, "epub_include_info_page", True)))
@@ -1574,7 +1360,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         hint(form, "写入 EPUB 的 language 字段，如 ja / zh / en。仅影响阅读器识别，不影响正文。")
 
         # ---- 更新策略 ----
-        form = make_group("更新策略", "何时重新生成，远端删除如何处理")
+        form = make_page()
         section(form, "更新判定")
         self.set_upd_mode = combo([
             ("比较远端更新时间（默认）", "timestamp"),
@@ -1618,7 +1404,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         hint(form, "关闭后已下载的文件保留在原目录，但新下载的作品会落到新昵称目录。")
 
         # ---- 网络 ----
-        form = make_group("网络", "User-Agent 与代理")
+        form = make_page()
         self.set_ua = QLineEdit(s.user_agent)
         form.addRow("User-Agent", self.set_ua)
 
@@ -1643,10 +1429,10 @@ class MainWindow(QMainWindow, RankingPageMixin):
         form.addRow("代理密码", self.proxy_pass)
 
         # ---- 登录 Cookie ----
-        form = make_group("登录 Cookie", "凭据只存本机；导出备份时明文包含")
+        form = make_page()
         self.cookie_edit = QPlainTextEdit()
         self.cookie_edit.setPlaceholderText("PHPSESSID=…（留空表示不修改）")
-        self.cookie_edit.setFixedHeight(tokens(current_mode())["edit_area_h"])
+        self.cookie_edit.setFixedHeight(74)
         form.addRow("Cookie", self.cookie_edit)
         r = QHBoxLayout()
         r.setSpacing(8)
@@ -1660,10 +1446,9 @@ class MainWindow(QMainWindow, RankingPageMixin):
         r.addWidget(btn_test); r.addWidget(btn_login); r.addWidget(btn_clear)
         r.addWidget(self.cookie_status, 1)
         form.addRow("", r)
-        hint(form, "未配置 Cookie 时，底部状态栏会出现「去配置」直达本小节。")
 
         # ---- 系统 ----
-        form = make_group("系统", "开机自启、备份与配置迁移")
+        form = make_page()
         self.set_autostart = QCheckBox("随 Windows 开机自启（静默驻留托盘）")
         self.set_autostart.setChecked(s.autostart)
         form.addRow("", self.set_autostart)
@@ -1693,7 +1478,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
                    "内容与手动导出一致、明文包含 Cookie，请勿外传或上传；超出份数的旧备份会自动删除。")
 
         # ---- 排行榜 ----
-        form = make_group("排行榜", "榜单抓取的开关、范围与记录方式")
+        form = make_page()
         section(form, "启用")
         self.set_ranking_enabled = QCheckBox("启用排行榜抓取（独立任务，不跟随每日抓取）")
         self.set_ranking_enabled.setChecked(bool(getattr(s, "ranking_enabled", False)))
@@ -1765,35 +1550,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
         hint(form, "放在数据目录的 logs 里，跟程序运行日志 run.log 挨着，双击就能看，"
                    "不需要打开本软件。每行一轮，内容和「排行榜 → 抓取历史」完全一致。")
 
+        self.settings_nav.setCurrentRow(0)
         return page
-
-    # ---------------------------------------------------- 设置页跳转联动
-    def _scroll_to_settings_group(self, index: int):
-        """胶囊条 → 滚动到对应小节。"""
-        if self._rail_guard or not (0 <= index < len(self._settings_groups)):
-            return
-        self._rail_guard = True
-        try:
-            gw = self._settings_groups[index]
-            self.settings_scroll.verticalScrollBar().setValue(max(0, gw.y() - 4))
-        finally:
-            self._rail_guard = False
-
-    def _sync_settings_rail(self, _value: int = 0):
-        """滚动 → 回写当前小节，让胶囊条始终反映实际位置。"""
-        if self._rail_guard or not getattr(self, "_settings_groups", None):
-            return
-        v = self.settings_scroll.verticalScrollBar().value()
-        cur = 0
-        for i, gw in enumerate(self._settings_groups):
-            if gw.y() <= v + 12:
-                cur = i
-        if self.settings_rail.currentIndex() != cur:
-            self._rail_guard = True
-            try:
-                self.settings_rail.setCurrentIndex(cur)
-            finally:
-                self._rail_guard = False
 
     def export_backup(self):
         from ..core import backup
@@ -1867,20 +1625,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
             ok = bool(credentials.load_cookie())
         except Exception:
             ok = False
-        self.conn_label.setText("已配置 Cookie" if ok else "未配置 Cookie")
-        set_dot(self.conn_dot, "ok" if ok else "warn")
-        try:
-            self.btn_cookie_fix.setVisible(not ok)
-        except Exception:
-            pass
-
-    def open_settings_section(self, label: str):
-        """跳到设置页的指定小节（默认跳到「登录 Cookie」所在项）。"""
-        names = [lb for lb, *_ in SETTINGS_SECTIONS]
-        idx = names.index(label) if label in names else 0
-        self.stack.setCurrentIndex(PAGE_SETTINGS)
-        self.nav.setCurrentIndex(PAGE_SETTINGS)
-        self.settings_rail.setCurrentIndex(idx)
+        _set_class(self.conn_badge, "badge-ok" if ok else "badge-warn")
+        self.conn_badge.setText("已配置 Cookie" if ok else "未配置 Cookie")
 
     def _collect_settings(self, save_paths: bool = True):
         s = self.settings
@@ -2078,28 +1824,38 @@ class MainWindow(QMainWindow, RankingPageMixin):
             pass
 
     def _decorate(self):
-        """按当前主题刷新所有图标与状态色。"""
+        """按当前主题刷新所有图标与顶栏按钮。"""
         t = tokens(current_mode())
-        on_accent, dim, danger = t["on_accent"], t["text_dim"], t["danger"]
+        accent, dim, on_accent = t["accent_text"], t["text_dim"], t["on_accent"]
 
         self.btn_run.setIcon(icon("play", on_accent, 15))
-        self.btn_stop.setIcon(icon("stop", danger, 15))
-        self.btn_theme.setIcon(
-            icon("moon" if current_mode() == "light" else "sun", dim, 17))
+        self.btn_stop.setIcon(icon("stop", t["danger"], 15))
 
-        self.nav.refresh_icons()
-        self.author_tabs.refresh_icons()
-        self.drawer.tabs.refresh_icons()
-        if getattr(self, "rank_view_combo", None) is not None:
-            self.rank_view_combo.refresh_icons()
+        for btn, name in (
+            (self.btn_theme, "moon" if current_mode() == "light" else "sun"),
+        ):
+            btn.setIcon(icon(name, dim, 17))
+
+        self._decorate_nav(self.nav, ["users", "activity", "search", "gauge", "sliders"])
+        self._decorate_nav(self.settings_nav,
+                           ["palette", "folder", "gauge", "globe", "key", "database"])
+
+    def _decorate_nav(self, nav: QListWidget, names: list):
+        """选中项用主色，未选中项用次级灰。"""
+        t = tokens(current_mode())
+        active, idle = t["accent_text"], t["text_dim"]
+        cur = nav.currentRow()
+        for i, name in enumerate(names):
+            item = nav.item(i)
+            if item:
+                item.setIcon(icon(name, active if i == cur else idle, 17))
 
     # ================================================================ 其他
     def select_settings_tab(self):
-        """跳到「设置 → 登录 Cookie」（定时任务缺 Cookie 等场景会调用）。
-
-        原实现写死索引 3，而 3 是「排行」页，导致提示去设置页却跳到了排行榜页。
-        """
-        self.open_settings_section("登录 Cookie")
+        self.stack.setCurrentIndex(3)
+        self.nav.blockSignals(True)
+        self.nav.setCurrentRow(3)
+        self.nav.blockSignals(False)
 
     def closeEvent(self, event):
         event.ignore()

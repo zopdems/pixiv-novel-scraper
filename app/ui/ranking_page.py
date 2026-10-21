@@ -8,15 +8,14 @@ from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateEdit,
                                QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-                               QInputDialog, QMessageBox,
+                               QInputDialog, QMessageBox, QPlainTextEdit,
                                QProgressBar, QPushButton, QStackedWidget,
-                               QTableWidget, QTableWidgetItem,
+                               QTableWidget, QTableWidgetItem, QTableView,
                                QVBoxLayout)
 
 from ..core.rank_db import (SRC_BACKFILL, SRC_MANUAL, ALL_MODES, R18_MODES,
                             RANK_MODES, mode_label)
 from .theme import current_mode, tokens
-from .widgets import SegmentedControl
 from .worker import RankingWorker
 
 
@@ -74,8 +73,7 @@ class RankingPageMixin:
         page, outer, _head = self._page(
             "排行榜", "抓取小说排行榜前一百名，记录名次变化；可按需把作品正文收进本地书库")
 
-        # 平面分区取代旧版的浮起卡片：工具条直接贴在标题下面，用发丝线分界
-        bl = self._block(outer, vertical=True)
+        bar, bl = self._card(margin=12, spacing=8)
         row = QHBoxLayout()
         row.setSpacing(8)
 
@@ -88,10 +86,9 @@ class RankingPageMixin:
         self.rank_mode_combo.setMinimumWidth(150)
         self.rank_mode_combo.currentIndexChanged.connect(self._on_rank_mode_changed)
 
-        # 视图切换也用分段控件，取代旧版的下拉框：三个视图是并列的，
-        # 没有「默认隐藏哪一项」的道理，点一下就能换
-        self.rank_view_combo = SegmentedControl(
-            [("作品榜", "works"), ("榜单作者", "authors"), ("抓取历史", "runs")])
+        self.rank_view_combo = QComboBox()
+        self.rank_view_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.rank_view_combo.setMinimumWidth(110)
 
         self.rank_date_edit = QDateEdit()
         self.rank_date_edit.setCalendarPopup(True)
@@ -102,7 +99,11 @@ class RankingPageMixin:
         cal = self.rank_date_edit.calendarWidget()
         cal.setGridVisible(True)
         cal.resize(360, 300)
-        # 日历配色与格子内边距已在主题里统一接管（QCalendarWidget 段），此处不再内联覆盖
+        # 配色已在主题里统一接管（QCalendarWidget 段）；这里再兜一道：
+        # 万一以后有人给 QTableView::item 加了内边距，日期数字也不会被挤掉。
+        view = cal.findChild(QTableView)
+        if view is not None:
+            view.setStyleSheet("QTableView::item { padding: 0px; }")
         self.rank_date_edit.setToolTip("选过去的日期再点「抓取榜单」即可补抓那一天的榜单")
         self.rank_date_edit.dateChanged.connect(self.refresh_ranking_table)
 
@@ -145,17 +146,36 @@ class RankingPageMixin:
         self.rank_last_label.setWordWrap(True)
         bl.addWidget(self.rank_last_label)
 
-        # 榜单日志不再单独占一张卡片：收进底部抽屉的「榜单日志」页签，
-        # 在别的页面也能看到进度，和主抓取日志共用同一个入口
-        note = QLabel("任务日志已收进底部抽屉（Ctrl+L → 榜单日志）")
-        note.setProperty("class", "hint")
-        bl.addWidget(note)
+        log_head = QHBoxLayout()
+        log_head.setSpacing(8)
+        title = QLabel("任务日志")
+        title.setProperty("class", "section-title")
+        log_head.addWidget(title)
+        log_head.addStretch(1)
+        btn_clear_log = QPushButton("清空")
+        btn_clear_log.clicked.connect(self.clear_rank_log)
+        log_head.addWidget(btn_clear_log)
+        bl.addLayout(log_head)
 
-        tl = self._block(outer, pad=(20, 8))
+        self.rank_log_view = QPlainTextEdit()
+        self.rank_log_view.setProperty("class", "log")
+        self.rank_log_view.setReadOnly(True)
+        self.rank_log_view.setMaximumBlockCount(2000)
+        self.rank_log_view.setFixedHeight(130)
+        self.rank_log_view.setPlaceholderText(
+            "抓取过程实时显示在这里：抓了哪个榜、多少条、哪篇下载失败。")
+        bl.addWidget(self.rank_log_view)
+        outer.addWidget(bar)
+
+        table_card, tl = self._card(margin=12, spacing=8)
 
         view_row = QHBoxLayout()
         view_row.setSpacing(8)
-        self.rank_view_combo.indexChanged.connect(self._on_rank_view_changed)
+        view_row.addWidget(QLabel("视图"))
+        self.rank_view_combo.addItem("作品榜", "works")
+        self.rank_view_combo.addItem("榜单作者", "authors")
+        self.rank_view_combo.addItem("抓取历史", "runs")
+        self.rank_view_combo.currentIndexChanged.connect(self._on_rank_view_changed)
         view_row.addWidget(self.rank_view_combo)
         view_row.addStretch(1)
 
@@ -214,7 +234,7 @@ class RankingPageMixin:
         self.rank_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.rank_table.setAlternatingRowColors(True)
         self.rank_table.verticalHeader().setVisible(False)
-        self.rank_table.verticalHeader().setDefaultSectionSize(tokens(current_mode())["row_h"])
+        self.rank_table.verticalHeader().setDefaultSectionSize(36)
         self.rank_table.setShowGrid(False)
         header = self.rank_table.horizontalHeader()
         header.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -225,11 +245,6 @@ class RankingPageMixin:
         # 开启排序后 Qt 默认按第 0 列「降序」，榜单会变成 100 在最上——必须显式指定升序
         self.rank_table.setSortingEnabled(True)
         self.rank_table.sortByColumn(0, Qt.AscendingOrder)
-        self._attach_row_menu(self.rank_table, [
-            ("打开作品页", lambda: self.open_rank_work_page(self.rank_table.currentRow(), 0)),
-            ("下载选中作品", self.download_selected_rank_work),
-            ("把作者加入名单", self.add_rank_author),
-        ])
         self.rank_stack.addWidget(self.rank_table)
 
         self.rank_author_table = QTableWidget(0, 7)
@@ -240,7 +255,7 @@ class RankingPageMixin:
         self.rank_author_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.rank_author_table.setAlternatingRowColors(True)
         self.rank_author_table.verticalHeader().setVisible(False)
-        self.rank_author_table.verticalHeader().setDefaultSectionSize(tokens(current_mode())["row_h"])
+        self.rank_author_table.verticalHeader().setDefaultSectionSize(36)
         self.rank_author_table.setShowGrid(False)
         ah = self.rank_author_table.horizontalHeader()
         ah.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -252,10 +267,6 @@ class RankingPageMixin:
         # 作者表默认按「上榜次数」降序，跟查询意图一致
         self.rank_author_table.setSortingEnabled(True)
         self.rank_author_table.sortByColumn(3, Qt.DescendingOrder)
-        self._attach_row_menu(self.rank_author_table, [
-            ("加入作者名单", self.add_selected_rank_authors),
-            ("打开 Pixiv 主页", self.open_rank_author_page),
-        ])
         self.rank_stack.addWidget(self.rank_author_table)
 
         self.rank_run_table = QTableWidget(0, 12)
@@ -266,7 +277,7 @@ class RankingPageMixin:
         self.rank_run_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.rank_run_table.setAlternatingRowColors(True)
         self.rank_run_table.verticalHeader().setVisible(False)
-        self.rank_run_table.verticalHeader().setDefaultSectionSize(tokens(current_mode())["row_h"])
+        self.rank_run_table.verticalHeader().setDefaultSectionSize(36)
         self.rank_run_table.setShowGrid(False)
         rh = self.rank_run_table.horizontalHeader()
         rh.setSectionResizeMode(11, QHeaderView.Stretch)
@@ -279,15 +290,14 @@ class RankingPageMixin:
         self.rank_run_table.sortByColumn(0, Qt.DescendingOrder)
         self.rank_stack.addWidget(self.rank_run_table)
 
-        # 三个视图共用一块全幅表格区，不再塞进卡片里
-        outer.addWidget(self.rank_stack, 1)
+        tl.addWidget(self.rank_stack, 1)
+        outer.addWidget(table_card, 1)
 
         hint = QLabel("双击打开作品页；「在榜」为连续上榜天数。正文下载复用单篇抓取管线，"
                       "默认只下未收录的作品，霸榜作品不会重复下载。")
         hint.setProperty("class", "hint")
         hint.setWordWrap(True)
-        foot = self._block(outer, pad=(20, 8))
-        foot.addWidget(hint)
+        outer.addWidget(hint)
         self._on_rank_view_changed()
         self._setup_rank_log()
         return page
@@ -855,10 +865,6 @@ class RankingPageMixin:
         self.btn_rank_stop.setEnabled(True)
         self.rank_busy.setVisible(True)
         self.rank_summary.setText("正在抓取榜单…")
-        # 日志在底部抽屉里：任务一开始就展开并切到「榜单日志」，进度随时可见
-        if not self.drawer.is_expanded():
-            self.drawer.set_expanded(True)
-        self.drawer.tabs.setCurrentIndex(1)
         self._rank_log_start("抓取榜单")
         self.rank_worker = RankingWorker(
             self.settings, self.db, self.rank_db, self.logger, modes, date=date,
