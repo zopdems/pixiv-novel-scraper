@@ -731,8 +731,25 @@ class MainWindow(QMainWindow, RankingPageMixin):
                 webbrowser.open(f"https://www.pixiv.net/artworks/{wid}")
 
     def refresh_authors(self):
+        # 重建表格会打乱当前行（排序后可能指向别的作者），先记住原来选中的是谁
+        keep = {}
+        for _tbl in (self.novel_author_table, self.illust_author_table):
+            _row = _tbl.currentRow()
+            _it = _tbl.item(_row, 1) if _row >= 0 else None
+            keep[_tbl] = _it.text() if _it else ""
+
         self._fill_author_table(self.novel_author_table, "novel")
         self._fill_author_table(self.illust_author_table, "illust")
+
+        # 按作者 ID 找回原来那一行，连续操作同一作者时不会误伤别人
+        for _tbl, _aid in keep.items():
+            if not _aid:
+                continue
+            for _row in range(_tbl.rowCount()):
+                _it = _tbl.item(_row, 1)
+                if _it and _it.text() == _aid:
+                    _tbl.setCurrentCell(_row, 0)
+                    break
         try:
             self._fill_deleted_tree()
         except Exception:
