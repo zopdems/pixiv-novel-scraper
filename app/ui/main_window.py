@@ -415,7 +415,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         if kind is None:
             QMessageBox.information(self, "提示", "请先切换到「小说作者」或「插画作者」标签页再添加。")
             return
-        if self.db.add_author(text, pending_validate=True, kind=kind):
+        if self.db.add_author(aid, pending_validate=True, kind=kind):
             self.author_input.clear()
             self.refresh_authors()
         else:

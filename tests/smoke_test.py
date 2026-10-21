@@ -918,6 +918,83 @@ _pixiv_api.get_user_status, _ui_worker.PixivClient, _ui_worker.load_cookie = (
     _ac_api, _ac_client, _ac_cookie)
 _ac_db.close()
 
+# ---- 系列全部 404 时补查账号（不触网）----
+from app.pixiv.api import SeriesContent  # noqa: E402
+from app.pixiv.client import PixivRequestError  # noqa: E402
+
+_sc_db = Database(path=os.path.join(tmp, "series.db"))
+_sc_db.add_author("9501", "系列全没", kind="novel")
+_sc_db.add_author("9502", "系列部分没", kind="novel")
+_sc_db.add_author("9503", "无系列", kind="novel")
+for _n, _a, _s in (("9101", "9501", "s1"), ("9102", "9501", "s2"),
+                   ("9103", "9502", "s3"), ("9104", "9502", "s4"),
+                   ("9105", "9503", "")):
+    _sc_db.upsert_novel({"novel_id": _n, "author_id": _a, "title": _n,
+                         "status": "ok", "series_id": _s})
+
+
+def _sc_profile(client, uid):
+    """单篇列表非空：这样不会走「零作品」那条检查，只考验系列分支。"""
+    return {"9501": ["9101", "9102"], "9502": ["9103", "9104"],
+            "9503": ["9105"]}.get(uid, []), []
+
+
+def _sc_series(client, sid):
+    if sid in ("s1", "s2", "s3"):
+        raise PixivRequestError("系列不存在", kind="not_found")
+    return SeriesContent(series_id=sid, title=sid, novel_ids=[])
+
+
+_sc_calls = []
+
+
+def _sc_status(client, uid):
+    _sc_calls.append(uid)
+    return False, ""  # 账号已注销
+
+
+_o_profile, _o_series = _pixiv_api.get_user_profile_ids, _pixiv_api.get_series_novel_ids
+_pixiv_api.get_user_profile_ids = _sc_profile
+_pixiv_api.get_series_novel_ids = _sc_series
+_pixiv_api.get_user_status = _sc_status
+
+_eng2 = ScraperEngine.__new__(ScraperEngine)
+_eng2.settings = Settings()
+_eng2.settings.redownload_missing = False
+_eng2.settings.write_md_index = False
+_eng2.settings.author_404_action = "disable"
+_eng2.db = _sc_db
+_eng2.logger = logging.getLogger("t")
+_eng2.report = type("R", (), {
+    "aborted_reason": "", "per_author": {}, "failed_count": 0, "new_count": 0,
+    "updated_count": 0, "skipped_count": 0, "deleted_count": 0, "illust_new": 0,
+    "illust_updated": 0, "illust_skipped": 0, "illust_failed": 0,
+    "illust_deleted": 0})()
+_eng2._emit = lambda *a, **k: None
+_eng2._refresh_author_md = lambda *a, **k: None
+_eng2._stop_event = type("E", (), {"is_set": lambda self: False})()
+_eng2.client = type("C", (), {"consecutive_failures": 0})()
+
+_eng2._process_author({"author_id": "9501", "author_name": "系列全没"})
+check("系列全 404：补查了账号状态", "9501" in _sc_calls)
+check("系列全 404：作者被自动停用",
+      _sc_db.get_author("9501", "novel")["enabled"] == 0)
+check("系列全 404：停用原因记为注销",
+      _sc_db.author_disable_reason("9501", "novel") == "deactivated")
+
+_sc_calls.clear()
+_eng2._process_author({"author_id": "9502", "author_name": "系列部分没"})
+check("系列部分 404：不触发账号检查", "9502" not in _sc_calls)
+check("系列部分 404：作者保持启用",
+      _sc_db.get_author("9502", "novel")["enabled"] == 1)
+
+_sc_calls.clear()
+_eng2._process_author({"author_id": "9503", "author_name": "无系列"})
+check("无系列作者：不触发账号检查", "9503" not in _sc_calls)
+
+_pixiv_api.get_user_profile_ids, _pixiv_api.get_series_novel_ids = _o_profile, _o_series
+_sc_db.close()
+
 print()
 if failures:
     print("失败项：", failures)
