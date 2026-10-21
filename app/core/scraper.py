@@ -306,7 +306,8 @@ class ScraperEngine:
             if name and not remote_name:
                 remote_name = name
 
-        for series_id in self.db.series_ids_by_author(aid):
+        series_ids = self.db.series_ids_by_author(aid)
+        for series_id in series_ids:
             self._guard_failures()
             if not self.db.should_poll_series(
                     series_id, self._cfg_int("series_recheck_days", SERIES_RECHECK_DAYS)):
@@ -331,6 +332,15 @@ class ScraperEngine:
                     name = self._process_novel(nid, aid, stat=stat)
                     if name and not remote_name:
                         remote_name = name
+
+        # 「系列全部 404」是个强信号：这类作者单篇列表往往还有返回（于是不会触发
+        # 上面的零作品检查），但系列分组已经全没了，账号多半已注销。这里补查一次
+        # 账号主体接口，把这条漏判路径堵上；没有系列的作者不受影响。
+        if series_ids and self.db.deleted_series_ids(aid).issuperset(series_ids):
+            self._guard_failures()
+            if not self._ensure_author_alive(aid, author, "novel"):
+                self.report.failed_count += stat["failed"]
+                return
 
         if remote_name and remote_name != (author.get("author_name") or ""):
             self.logger.info("作者 %s 昵称变更：%s -> %s", aid, author.get("author_name"), remote_name)
