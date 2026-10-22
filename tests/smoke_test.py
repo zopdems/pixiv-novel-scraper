@@ -1009,6 +1009,26 @@ check("误标恢复：确实消失的作品仍标删除",
 _pixiv_api.get_user_profile_ids, _pixiv_api.get_series_novel_ids = _o_profile, _o_series
 _sc_db.close()
 
+# ---- 「共删小说」统计：单篇删除 + 已删系列里的作品，去重 ----
+_dt_db = Database(path=os.path.join(tmp, "dtotal.db"))
+_dt_db.add_author("9601", "统计作者", kind="novel")
+_dt_db.upsert_novel({"novel_id": "9301", "author_id": "9601", "title": "单篇被删",
+                     "status": "deleted", "series_id": ""})
+_dt_db.upsert_novel({"novel_id": "9302", "author_id": "9601", "title": "系列里还正常",
+                     "status": "ok", "series_id": "s9"})
+_dt_db.upsert_novel({"novel_id": "9303", "author_id": "9601", "title": "系列里也被删",
+                     "status": "deleted", "series_id": "s9"})
+_dt_db.upsert_novel({"novel_id": "9304", "author_id": "9601", "title": "未删系列里",
+                     "status": "ok", "series_id": "s10"})
+_dt_db.mark_series_deleted("s9", "9601")
+check("共删小说：deleted 计数不变",
+      _dt_db.author_deleted_novel_count("9601") == 2)
+check("共删小说：系列删除只算一个系列",
+      _dt_db.deleted_series_count("9601") == 1)
+check("共删小说：单篇 + 已删系列里的作品且去重",
+      _dt_db.author_deleted_total("9601") == 3)
+_dt_db.close()
+
 print()
 if failures:
     print("失败项：", failures)

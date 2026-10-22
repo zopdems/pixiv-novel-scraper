@@ -265,6 +265,16 @@ class Database:
         ).fetchone()
         return int(row[0])
 
+    def author_deleted_total(self, author_id: str) -> int:
+        """总共删了多少小说：被标删除的单篇 + 已删系列里包含的作品（自动去重）。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM novels WHERE author_id=? AND "
+            "(status='deleted' OR series_id IN "
+            "(SELECT series_id FROM deleted_series WHERE author_id=?))",
+            (author_id, author_id),
+        ).fetchone()
+        return int(row[0])
+
     # ---- novels ----
     def get_novel(self, novel_id: str):
         row = self._conn.execute("SELECT * FROM novels WHERE novel_id=?", (novel_id,)).fetchone()

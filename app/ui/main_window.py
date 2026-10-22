@@ -264,7 +264,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
-        for i, w in enumerate([220, 100, 64, 140, 96, 84, 84][:len(headers)]):
+        for i, w in enumerate([220, 100, 64, 140, 96, 84, 84, 84][:len(headers)]):
             table.setColumnWidth(i, w)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -329,7 +329,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         table_card, tl = self._card(margin=12, spacing=8)
         self.author_tabs = QTabWidget()
         self.novel_author_table = self._make_author_table(
-            ["昵称", "作者 ID", "状态", "最近抓取", "已收录小说", "已删单篇", "已删系列"])
+            ["昵称", "作者 ID", "状态", "最近抓取", "已收录小说", "已删单篇", "已删系列", "共删小说"])
         self.illust_author_table = self._make_author_table(
             ["昵称", "作者 ID", "状态", "最近抓取", "已收录插画", "已删插画"])
         self.author_tabs.addTab(self.novel_author_table, "小说作者")
@@ -571,6 +571,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
                     self.db.author_novel_count(aid),
                     self.db.author_deleted_novel_count(aid),
                     self.db.deleted_series_count(aid),
+                    self.db.author_deleted_total(aid),
                 ]
             else:
                 counts = [
@@ -590,6 +591,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
             for offset, val in enumerate(counts):
                 item = QTableWidgetItem()
                 item.setData(Qt.DisplayRole, val)
+                if kind == "novel" and offset == 3:
+                    item.setToolTip("共删小说 = 已删单篇 + 已删系列里包含的作品（重复只算一次）")
                 table.setItem(i, 4 + offset, item)
         table.setSortingEnabled(True)
 
