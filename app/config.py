@@ -121,6 +121,8 @@ class Settings:
     ranking_enabled: bool = False         # 是否启用排行榜抓取
     ranking_modes: list = field(default_factory=lambda: ["daily", "weekly"])
     ranking_include_r18: bool = False     # 是否抓取 R-18 榜单（需要登录 Cookie）
+    # R-18 榜单细分：空 = 沿用 ranking_include_r18（开了就抓全部 R-18 榜）
+    ranking_r18_modes: list = field(default_factory=list)
     ranking_download: bool = True         # 是否顺便下载正文（复用单篇管线）
     ranking_download_mode: str = "new"    # new=仅首次上榜下载 / follow_update=跟随更新判定
     ranking_language_filter: bool = True  # 只保留简体中文作品（R-18 榜同样处理）

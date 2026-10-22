@@ -806,7 +806,12 @@ class RankingPageMixin:
 
     def _rank_modes_for_fetch(self) -> list:
         modes = list(getattr(self.settings, "ranking_modes", []) or [])
-        if getattr(self.settings, "ranking_include_r18", False):
+        # R-18 可以细分到具体榜单：勾了哪几个就抓哪几个；没细分则沿用旧的总开关
+        r18 = [m for m in (getattr(self.settings, "ranking_r18_modes", []) or [])
+               if m in R18_MODES]
+        if r18:
+            modes += [m for m in r18 if m not in modes]
+        elif getattr(self.settings, "ranking_include_r18", False):
             modes += [m for m in R18_MODES if m not in modes]
         return [m for m in modes if m in ALL_MODES] or list(RANK_MODES[:2])
 

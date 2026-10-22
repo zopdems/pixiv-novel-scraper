@@ -17,7 +17,7 @@ from ..config import app_data_dir, reset_advanced_settings, save_settings as per
 from ..core import paths
 from ..core.db import DISABLE_REASON_MANUAL
 from ..core.models import STATUS_LABELS, Status, status_label
-from ..core.rank_db import RANK_MODES, RankDatabase, mode_label
+from ..core.rank_db import R18_MODES, RANK_MODES, RankDatabase, mode_label
 from ..core.utils import extract_author_id
 from ..pixiv.client import PixivClient
 from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
@@ -1609,11 +1609,23 @@ class MainWindow(QMainWindow, RankingPageMixin):
         hint(form, "只影响定时任务每天自动抓的榜。「排行」页面里的榜单下拉是临时查看/手动抓取用的，"
                    "两者互不影响——手动抓哪个以页面下拉框为准。")
 
-        self.set_ranking_r18 = QCheckBox("同时抓取 R-18 榜单（需要登录 Cookie，否则会 403）")
-        self.set_ranking_r18.setChecked(bool(getattr(s, "ranking_include_r18", False)))
-        form.addRow("", self.set_ranking_r18)
-        hint(form, "注意：即使抓取了 R-18 榜单，正文是否下载仍受「抓取策略 → 包含 R-18」控制，"
-                   "全局未开启时只会记录元信息。")
+        # R-18 榜单独细分：想只抓某一个（比如男性向 R-18）时不用连带上另外两个
+        self.rank_r18_boxes = {}
+        r18_row = QHBoxLayout()
+        r18_row.setSpacing(10)
+        _r18_sel = list(getattr(s, "ranking_r18_modes", []) or [])
+        if not _r18_sel and getattr(s, "ranking_include_r18", False):
+            _r18_sel = list(R18_MODES)      # 旧配置迁移：原来开着的按全选处理
+        for m in R18_MODES:
+            box = QCheckBox(mode_label(m))
+            box.setChecked(m in _r18_sel)
+            self.rank_r18_boxes[m] = box
+            r18_row.addWidget(box)
+        r18_row.addStretch(1)
+        form.addRow("R-18 榜单", self._wrap_layout(r18_row))
+        hint(form, "需要登录 Cookie，否则会 403。上面普通榜一个都不勾、只勾这里的"
+                   "「男性向 R-18」= 每天只抓这一个榜；正文是否下载仍受"
+                   "「抓取策略 → 包含 R-18」控制，全局未开启时只会记录元信息。")
 
         section(form, "正文下载")
         self.set_ranking_download = QCheckBox("一并下载上榜作品的正文")
@@ -1797,7 +1809,9 @@ class MainWindow(QMainWindow, RankingPageMixin):
         s.auto_backup_keep = int(self.set_backup_keep.value())
         s.ranking_enabled = self.set_ranking_enabled.isChecked()
         s.ranking_modes = [m for m, box in self.rank_mode_boxes.items() if box.isChecked()]
-        s.ranking_include_r18 = self.set_ranking_r18.isChecked()
+        s.ranking_r18_modes = [m for m, box in self.rank_r18_boxes.items() if box.isChecked()]
+        # 旧字段同步保留语义：勾了任一 R-18 榜即为 true，方便老逻辑与手改配置判断
+        s.ranking_include_r18 = bool(s.ranking_r18_modes)
         s.ranking_download = self.set_ranking_download.isChecked()
         s.ranking_download_mode = str(self.set_ranking_dl_mode.currentData() or "new")
         s.ranking_language_filter = self.set_ranking_lang.isChecked()
