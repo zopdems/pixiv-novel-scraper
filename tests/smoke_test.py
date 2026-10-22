@@ -992,6 +992,20 @@ _sc_calls.clear()
 _eng2._process_author({"author_id": "9503", "author_name": "无系列"})
 check("无系列作者：不触发账号检查", "9503" not in _sc_calls)
 
+# 误标恢复：曾被标「远端已删除」的作品重新出现在列表里，应恢复为正常
+_sc_db.add_author("9504", "误标恢复", kind="novel")
+_sc_db.upsert_novel({"novel_id": "9201", "author_id": "9504", "title": "t1",
+                     "status": "deleted", "series_id": ""})
+_sc_db.upsert_novel({"novel_id": "9202", "author_id": "9504", "title": "t2",
+                     "status": "ok", "series_id": ""})
+_pixiv_api.get_user_profile_ids = lambda c, uid: (
+    (["9201"], []) if uid == "9504" else _sc_profile(c, uid))
+_eng2._process_author({"author_id": "9504", "author_name": "误标恢复"})
+check("误标恢复：远端重现的作品恢复为正常",
+      _sc_db.get_novel("9201")["status"] == "ok")
+check("误标恢复：确实消失的作品仍标删除",
+      _sc_db.get_novel("9202")["status"] == "deleted")
+
 _pixiv_api.get_user_profile_ids, _pixiv_api.get_series_novel_ids = _o_profile, _o_series
 _sc_db.close()
 

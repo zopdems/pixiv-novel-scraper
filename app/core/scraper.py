@@ -284,6 +284,12 @@ class ScraperEngine:
                     self.db.set_novel_status(nid, Status.DELETED)
                     stat["deleted"] += 1
                     self.logger.info("作品 %s 远端已删除，本地保留", nid)
+                elif nid in remote_ids and rec["status"] == Status.DELETED:
+                    # 之前判过「远端已删除」，现在又出现在列表里：多半是那次接口
+                    # 返回不全（风控 / 临时故障）误判的。恢复成正常，让它重新参与
+                    # 更新判定；本地文件缺失的会由 redownload_missing 自动补下。
+                    self.db.set_novel_status(nid, Status.OK)
+                    self.logger.info("作品 %s 远端重新上线，恢复为正常", nid)
 
         remote_name = ""
         missing_files = []
