@@ -27,7 +27,7 @@ class _StepPage(QWizardPage):
         badge.setFixedSize(34, 34)
         badge.setAlignment(Qt.AlignCenter)
         badge.setStyleSheet(
-            "background: %s; color: %s; border-radius: 17px;"
+            "background: %s; color: %s; border-radius: 2px;"
             "font-size: 14px; font-weight: 700;" % (t["accent_soft"], t["accent_text"])
         )
         head.addWidget(badge, 0, Qt.AlignTop)
@@ -232,7 +232,7 @@ class RiskPage(_StepPage):
         box.setWordWrap(True)
         box.setProperty("class", "soft")
         box.setContentsMargins(14, 12, 14, 12)
-        box.setStyleSheet("QLabel { padding: 12px 14px; border-radius: 10px; }")
+        box.setStyleSheet("QLabel { padding: 12px 14px; border-radius: 2px; }")
         layout.addWidget(box)
 
         self.agree = QCheckBox("我已知悉并自行承担风险")

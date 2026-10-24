@@ -133,10 +133,11 @@ _ASSET = {
 
 
 def _svg(inner: str, color: str, stroke: float, fill: str = "none") -> bytes:
+    # 方头线帽 + 直角连接：比圆头更硬朗，贴合明日方舟的工业线条感
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" '
         'viewBox="0 0 24 24" fill="%s" stroke="%s" stroke-width="%s" '
-        'stroke-linecap="round" stroke-linejoin="round">%s</svg>'
+        'stroke-linecap="square" stroke-linejoin="miter">%s</svg>'
         % (fill, color, stroke, inner)
     ).encode("utf-8")
 
@@ -207,12 +208,12 @@ def asset(name: str, color: str = "#ffffff") -> str:
 
 # ------------------------------------------------------------ 品牌标识
 
-_MARK_FROM = "#3FB7FF"
-_MARK_TO = "#0064D8"
+_MARK_BG = "#16171C"          # 深工业底
+_MARK_AMBER = "#F2A33C"       # 罗德岛琥珀橙
 
 
 def app_mark(size: int = 40) -> QPixmap:
-    """应用标识：蓝青渐变圆角方块 + 白色 P。"""
+    """应用标识：深工业底 + 琥珀橙「菱形切角」+ 白色 P（明日方舟徽记质感）。"""
     dpr = 3
     px = size * dpr
     pm = QPixmap(px, px)
@@ -220,18 +221,25 @@ def app_mark(size: int = 40) -> QPixmap:
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.Antialiasing, True)
 
-    grad = QLinearGradient(0, 0, px, px)
-    grad.setColorAt(0.0, QColor(_MARK_FROM))
-    grad.setColorAt(1.0, QColor(_MARK_TO))
+    # 深底，锐利小圆角
     painter.setPen(Qt.NoPen)
-    painter.setBrush(QBrush(grad))
-    radius = px * 0.28
-    painter.drawRoundedRect(QRectF(0, 0, px, px), radius, radius)
+    painter.setBrush(QColor(_MARK_BG))
+    painter.drawRoundedRect(QRectF(0, 0, px, px), px * 0.12, px * 0.12)
 
+    # 琥珀橙描边，形成内嵌边框
+    pen = QPen(QColor(_MARK_AMBER))
+    pen.setWidthF(px * 0.045)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    inset = px * 0.07
+    painter.drawRoundedRect(QRectF(inset, inset, px - 2 * inset, px - 2 * inset),
+                            px * 0.08, px * 0.08)
+
+    # 中央「P」字（白色，硬朗粗体）
     font = QFont("Segoe UI Semibold", 1, QFont.Bold)
-    font.setPixelSize(int(px * 0.54))
+    font.setPixelSize(int(px * 0.5))
     painter.setFont(font)
-    painter.setPen(QPen(QColor("#ffffff")))
+    painter.setPen(QPen(QColor("#FFFFFF")))
     painter.drawText(QRectF(0, px * 0.02, px, px * 0.98), Qt.AlignCenter, "P")
     painter.end()
 

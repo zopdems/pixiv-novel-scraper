@@ -207,7 +207,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        for name in ["作者", "任务", "检索", "排行", "设置"]:
+        self._nav_labels = ["作者", "任务", "检索", "排行", "设置"]
+        for name in self._nav_labels:
             self.nav.addItem(name)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         v.addWidget(self.nav, 1)
@@ -561,22 +562,32 @@ class MainWindow(QMainWindow, RankingPageMixin):
         authors = self.db.list_authors(kind=kind)
         tk = tokens(current_mode())
         accent, muted = tk["accent"], tk["text_muted"]
+        # 一次 SQL 取全部作者的计数，避免每位作者发 4 条查询（作者多时表格会明显卡顿）
+        try:
+            counts_map = self.db.author_counts_bulk(kind)
+        except Exception:
+            counts_map = {}
+        zero = {"novels": 0, "deleted_novels": 0, "deleted_series": 0, "deleted_total": 0,
+                "illusts": 0, "deleted_illusts": 0}
         table.setSortingEnabled(False)
         table.setRowCount(len(authors))
         for i, a in enumerate(authors):
             aid = a["author_id"]
             display, st = author_display_name(a)
+            c = counts_map.get(aid)
+            if c is None:
+                c = zero
             if kind == "novel":
                 counts = [
-                    self.db.author_novel_count(aid),
-                    self.db.author_deleted_novel_count(aid),
-                    self.db.deleted_series_count(aid),
-                    self.db.author_deleted_total(aid),
+                    c.get("novels", 0),
+                    c.get("deleted_novels", 0),
+                    c.get("deleted_series", 0),
+                    c.get("deleted_total", 0),
                 ]
             else:
                 counts = [
-                    self.db.author_illust_count(aid),
-                    self.db.author_deleted_illust_count(aid),
+                    c.get("illusts", 0),
+                    c.get("deleted_illusts", 0),
                 ]
 
             table.setItem(i, 0, decorate_name_item(QTableWidgetItem(display), st, accent, muted))
@@ -762,8 +773,19 @@ class MainWindow(QMainWindow, RankingPageMixin):
             m = len(self.db.list_authors(kind="illust"))
             root = self.settings.epub_root or "未设置"
             self.stat_label.setText(f"小说作者 {n} 位  ·  插画作者 {m} 位  ·  EPUB：{root}")
+            # 侧边栏「作者」导航项带数量徽标
+            self._update_nav_badges(n + m)
         except Exception:
             pass
+
+    def _update_nav_badges(self, author_count: int):
+        """把作者数量标到侧边栏「作者」导航项上。"""
+        if not hasattr(self, "_nav_labels"):
+            return
+        item = self.nav.item(self._nav_labels.index("作者"))
+        if item is None:
+            return
+        item.setText(f"作者  ·  {author_count}")
 
     # ================================================================ 任务
     def _build_tasks_page(self):
@@ -786,8 +808,9 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
         self.busy = QProgressBar()
         self.busy.setRange(0, 0)
-        self.busy.setFixedWidth(110)
+        self.busy.setFixedWidth(190)
         self.busy.setTextVisible(False)
+        self.busy.setToolTip("抓取进度（按作者计）")
         self.busy.setVisible(False)
 
         btn_logs = QPushButton("打开日志目录")
@@ -896,7 +919,19 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
     def on_progress(self, event: dict):
         kind = event.get("kind")
-        if kind == "author_start":
+        if kind == "run_scope":
+            total = int(event.get("total") or 0)
+            if total > 0:
+                self.busy.setRange(0, total)
+                self.busy.setValue(0)
+                self.busy.setTextVisible(True)
+                self.busy.setFormat(f"0 / {total} 位作者")
+        elif kind == "run_progress":
+            done = int(event.get("done") or 0)
+            total = int(event.get("total") or 0)
+            self.busy.setValue(done)
+            self.busy.setFormat(f"{done} / {total} 位作者")
+        elif kind == "author_start":
             self.progress_view.appendPlainText(f"→ 处理作者 {event.get('author_name')}（{event.get('author_id')}）")
         elif kind == "novel_done":
             tag = "重打包" if event.get("updated") else "新下载"
@@ -921,6 +956,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.busy.setVisible(False)
+        self.busy.setRange(0, 0)  # 回到不确定态，供下次「忙碌」起点使用
+        self.busy.setTextVisible(False)
         failed = getattr(report, "failed_count", 0)
         if getattr(report, "aborted_reason", None):
             _set_class(self.run_status, "badge-warn")
@@ -1008,7 +1045,10 @@ class MainWindow(QMainWindow, RankingPageMixin):
                     item.setData(Qt.UserRole, kind)  # 记录是小说还是插画
                 self.failed_table.setItem(i, c, item)
         self.failed_table.setSortingEnabled(True)
-        self.failed_count.setText(f"共 {len(rows)} 条" if rows else "暂无记录")
+        if rows:
+            self.failed_count.setText(f"共 {len(rows)} 条")
+        else:
+            self.failed_count.setText("暂无失败或已删除的作品，一切正常")
 
     def _selected_failed_item(self):
         """返回 (kind, work_id)；未选中时返回 (None, None)。"""
@@ -1145,7 +1185,10 @@ class MainWindow(QMainWindow, RankingPageMixin):
                 rec.get("local_path") or "-",
             ]):
                 self.search_table.setItem(i, c, QTableWidgetItem(str(text)))
-        self.search_count.setText(f"共 {len(rows)} 条")
+        if rows:
+            self.search_count.setText(f"共 {len(rows)} 条")
+        else:
+            self.search_count.setText("没有匹配的作品（试试换关键词，或先抓取再检索）")
 
     def open_novel_dir(self):
         row = self.search_table.currentRow()
@@ -1351,6 +1394,23 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.set_cap.setValue(int(getattr(s, "max_novels_per_author", 0) or 0))
         form.addRow("每作者单次新增上限", self.set_cap)
         hint(form, "0 = 不限（默认）。仅限制「本次新发现」的作品数，本地缺失文件的补下载不受限制。")
+
+        section(form, "分批抓取")
+        self.set_batch_limit = QSpinBox()
+        self.set_batch_limit.setRange(0, 9999)
+        self.set_batch_limit.setSpecialValueText("不限")
+        self.set_batch_limit.setValue(int(getattr(s, "batch_limit", 0) or 0))
+        form.addRow("每轮最多下载", self.set_batch_limit)
+        hint(form, "0 = 不限（默认）。设为 50 表示每轮最多下载 50 部（小说+图片合计），"
+                   "达到后本轮提前结束，剩余作品等下一轮。")
+
+        self.set_batch_interval = QSpinBox()
+        self.set_batch_interval.setRange(1, 1440)
+        self.set_batch_interval.setSuffix(" 分钟")
+        self.set_batch_interval.setValue(int(getattr(s, "batch_interval_minutes", 30) or 30))
+        form.addRow("续抓间隔", self.set_batch_interval)
+        hint(form, "上一轮达到上限后，等这么久自动接着抓下一批，直到全部抓完。"
+                   "例如设 50 部 + 30 分钟，就是每次抓 50 部、歇半小时，循环往复。")
 
         self.set_whitelist = QLineEdit(",".join(getattr(s, "tag_whitelist", []) or []))
         self.set_whitelist.setPlaceholderText("留空 = 不限制；多个标签用英文逗号分隔")
@@ -1780,6 +1840,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
         s.disabled_recheck_days = int(self.set_recheck.value())
         s.catch_up_window_minutes = int(self.set_catchup.value())
         s.max_novels_per_author = int(self.set_cap.value())
+        s.batch_limit = int(self.set_batch_limit.value())
+        s.batch_interval_minutes = int(self.set_batch_interval.value())
         s.tag_whitelist = [t.strip() for t in self.set_whitelist.text().split(",") if t.strip()]
         s.keyword_include = self.set_kw_in.text().strip()
         s.keyword_exclude = self.set_kw_ex.text().strip()
@@ -1841,6 +1903,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.set_recheck.setValue(int(getattr(s, "disabled_recheck_days", 0) or 0))
         self.set_catchup.setValue(int(getattr(s, "catch_up_window_minutes", 0) or 0))
         self.set_cap.setValue(int(getattr(s, "max_novels_per_author", 0) or 0))
+        self.set_batch_limit.setValue(int(getattr(s, "batch_limit", 0) or 0))
+        self.set_batch_interval.setValue(int(getattr(s, "batch_interval_minutes", 30) or 30))
         self.set_whitelist.setText(",".join(getattr(s, "tag_whitelist", []) or []))
         self.set_kw_in.setText(getattr(s, "keyword_include", "") or "")
         self.set_kw_ex.setText(getattr(s, "keyword_exclude", "") or "")
@@ -1963,8 +2027,19 @@ class MainWindow(QMainWindow, RankingPageMixin):
             btn.setIcon(icon(name, dim, 17))
 
         self._decorate_nav(self.nav, ["users", "activity", "search", "gauge", "sliders"])
-        self._decorate_nav(self.settings_nav,
-                           ["palette", "folder", "gauge", "globe", "key", "database"])
+        # 顺序必须与 _build_settings_page 里的 addItems 一一对应，缺一个就会整体错位
+        self._decorate_nav(self.settings_nav, [
+            "palette",   # 外观
+            "folder",    # 存储路径
+            "gauge",     # 抓取策略
+            "file-text", # 文件输出
+            "book",      # 内容编排
+            "refresh",   # 更新策略
+            "globe",     # 网络
+            "key",       # 登录 Cookie
+            "database",  # 系统
+            "alert",     # 排行榜（榜单徽标）
+        ])
 
     def _decorate_nav(self, nav: QListWidget, names: list):
         """选中项用主色，未选中项用次级灰。"""
@@ -1977,11 +2052,15 @@ class MainWindow(QMainWindow, RankingPageMixin):
                 item.setIcon(icon(name, active if i == cur else idle, 17))
 
     # ================================================================ 其他
+    # 主导航与 stack 的页序必须一致：作者0 / 任务1 / 检索2 / 排行3 / 设置4
+    PAGE_SETTINGS = 4
+
     def select_settings_tab(self):
-        self.stack.setCurrentIndex(3)
+        """切到设置页（Cookie 失效等需要用户处理时由定时任务调用）。"""
         self.nav.blockSignals(True)
-        self.nav.setCurrentRow(3)
+        self.nav.setCurrentRow(self.PAGE_SETTINGS)
         self.nav.blockSignals(False)
+        self.stack.setCurrentIndex(self.PAGE_SETTINGS)
 
     def closeEvent(self, event):
         event.ignore()

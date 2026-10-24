@@ -1,14 +1,12 @@
-"""视觉主题：设计令牌 + QPalette + QSS 生成器。
+"""视觉主题：明日方舟（Arknights）工业风设计令牌 + QPalette + QSS 生成器。
 
-提供浅色 / 深色两套配色，QSS 由模板 + 令牌渲染，切换主题时整体重建即可。
-对外接口：
-    LIGHT / DARK              设计令牌字典
-    tokens(mode)              取令牌
-    build_qss(mode)           生成样式表
-    build_palette(mode)       生成 QPalette
-    apply_theme(app, mode)    一次性应用（含系统跟随）
-    resolve_mode(mode)        'auto' -> 'light' / 'dark'
-    current_mode()            当前生效模式
+视觉语言：
+- 深色工业底 + 罗德岛「琥珀橙」强调色；
+- 锐利小圆角（2px）替代圆润大圆角，硬朗描边分层，营造机兵面板质感；
+- 选中态用「左侧强调条 + 主色文字」，而非整块高亮填充。
+
+对外接口与旧版完全一致（tokens / build_qss / build_palette / apply_theme /
+resolve_mode / current_mode），token 键名不变，既有代码零改动即可切换风格。
 """
 
 import string
@@ -21,84 +19,91 @@ from .icons import asset
 
 LIGHT = {
     "mode": "light",
-    # 背景层级
-    "canvas": "#F1F4F9",        # 窗口底色
-    "sidebar": "#FFFFFF",       # 侧边导航
-    "surface": "#FFFFFF",       # 卡片
-    "surface_alt": "#F6F8FC",   # 卡片内浅底 / 表头 / 斑马纹
-    "surface_hover": "#EEF2F8", # 悬停
+    # 背景层级（明亮工业：米白底 + 硬朗灰层次）
+    "canvas": "#E8E6E1",        # 窗口底色（暖灰米白）
+    "sidebar": "#F2F0EB",       # 侧边导航
+    "surface": "#FBFAF7",       # 卡片
+    "surface_alt": "#EFEDE8",   # 卡片内浅底 / 表头 / 斑马纹
+    "surface_hover": "#E3E0DA", # 悬停
     # 描边
-    "border": "#E4E9F0",
-    "border_strong": "#D2DAE5",
-    "separator": "#EDF1F6",
+    "border": "#D6D2CA",
+    "border_strong": "#BDB8AF",
+    "separator": "#E4E1DB",
     # 文字
-    "text": "#1B2430",
-    "text_dim": "#5E6B80",
-    "text_muted": "#98A3B5",
-    # 主色（Pixiv 蓝）
-    "accent": "#0096FA",
-    "accent_hover": "#0A87E0",
-    "accent_press": "#0776C6",
-    "accent_soft": "#E4F2FF",
-    "accent_soft_border": "#BEE1FF",
-    "accent_text": "#0072C6",
+    "text": "#23211E",
+    "text_dim": "#5C5852",
+    "text_muted": "#938E85",
+    # 主色（罗德岛琥珀橙）
+    "accent": "#A8640A",
+    "accent_hover": "#8F5608",
+    "accent_press": "#774607",
+    "accent_soft": "#F3E4CD",
+    "accent_soft_border": "#E0C79C",
+    "accent_text": "#8A5508",
     "on_accent": "#FFFFFF",
     # 语义色
-    "success": "#16A34A",
-    "success_soft": "#E6F7EE",
-    "warn": "#D97A06",
-    "warn_soft": "#FDF2E2",
-    "danger": "#E0453E",
-    "danger_soft": "#FDECEB",
-    # 日志终端
-    "log_bg": "#181D26",
-    "log_fg": "#C3D0E0",
-    "log_dim": "#7B8AA0",
+    "success": "#2E7D4F",
+    "success_soft": "#DFEFE4",
+    "warn": "#B06A08",
+    "warn_soft": "#F7E9D4",
+    "danger": "#B5433A",
+    "danger_soft": "#F5DFDD",
+    # 日志终端（始终深色，贴合工业终端）
+    "log_bg": "#141416",
+    "log_fg": "#D9D5CC",
+    "log_dim": "#7E7A72",
     # 其它
-    "scroll": "#C9D2DD",
-    "scroll_hover": "#9DA9BA",
-    "tip_bg": "#1B2430",
-    "tip_fg": "#FFFFFF",
-    "shadow": "rgba(23, 43, 77, 0.10)",
+    "scroll": "#BDB8AF",
+    "scroll_hover": "#938E85",
+    "tip_bg": "#23211E",
+    "tip_fg": "#F5F3EF",
+    "shadow": "rgba(40, 36, 28, 0.14)",
 }
 
 DARK = {
     "mode": "dark",
-    "canvas": "#12151B",
-    "sidebar": "#191D25",
-    "surface": "#1D222B",
-    "surface_alt": "#232935",
-    "surface_hover": "#2A313D",
-    "border": "#2B323D",
-    "border_strong": "#3A434F",
-    "separator": "#242A34",
-    "text": "#E6EAF1",
-    "text_dim": "#9BA7B8",
-    "text_muted": "#6C7789",
-    "accent": "#3FB4FF",
-    "accent_hover": "#63C3FF",
-    "accent_press": "#2299E8",
-    "accent_soft": "#123349",
-    "accent_soft_border": "#1E4E70",
-    "accent_text": "#7FCDF7",
-    "on_accent": "#08131C",
-    "success": "#3FCF8E",
-    "success_soft": "#12331F",
-    "warn": "#F5A524",
-    "warn_soft": "#33260E",
-    "danger": "#FF6B63",
-    "danger_soft": "#3A1F1E",
-    "log_bg": "#0D1015",
-    "log_fg": "#A6B3C5",
-    "log_dim": "#67737F",
-    "scroll": "#39414E",
-    "scroll_hover": "#4E5867",
-    "tip_bg": "#2A313D",
-    "tip_fg": "#E6EAF1",
-    "shadow": "rgba(0, 0, 0, 0.35)",
+    # 背景层级（罗德岛主界面：近黑工业底）
+    "canvas": "#0C0D10",        # 窗口底色
+    "sidebar": "#111217",       # 侧边导航
+    "surface": "#16171C",       # 卡片
+    "surface_alt": "#1D1E24",   # 卡片内浅底 / 表头 / 斑马纹
+    "surface_hover": "#26272F", # 悬停
+    # 描边
+    "border": "#2A2C34",
+    "border_strong": "#3A3D47",
+    "separator": "#212329",
+    # 文字
+    "text": "#EAEBF0",
+    "text_dim": "#9BA0AB",
+    "text_muted": "#686C76",
+    # 主色（罗德岛琥珀橙）
+    "accent": "#F2A33C",
+    "accent_hover": "#F7B45C",
+    "accent_press": "#CE8A2E",
+    "accent_soft": "#2A2012",
+    "accent_soft_border": "#4A3A1E",
+    "accent_text": "#F5B65A",
+    "on_accent": "#1C1408",
+    # 语义色
+    "success": "#4BBE7E",
+    "success_soft": "#12291C",
+    "warn": "#F2A33C",
+    "warn_soft": "#2B2112",
+    "danger": "#E5554A",
+    "danger_soft": "#301A18",
+    # 日志终端
+    "log_bg": "#0A0B0E",
+    "log_fg": "#C9CBD2",
+    "log_dim": "#62656E",
+    # 其它
+    "scroll": "#33363F",
+    "scroll_hover": "#4A4E59",
+    "tip_bg": "#1D1E24",
+    "tip_fg": "#EAEBF0",
+    "shadow": "rgba(0, 0, 0, 0.5)",
 }
 
-_CURRENT = {"mode": "light"}
+_CURRENT = {"mode": "dark"}
 
 
 def tokens(mode: str = None) -> dict:
@@ -132,7 +137,7 @@ def resolve_mode(mode: str) -> str:
 
 # ------------------------------------------------------------- QPalette
 
-def build_palette(mode: str = "light") -> QPalette:
+def build_palette(mode: str = "dark") -> QPalette:
     t = tokens(mode)
     p = QPalette()
     p.setColor(QPalette.Window, QColor(t["canvas"]))
@@ -173,8 +178,8 @@ QMainWindow, QDialog, QWizard, QMessageBox {
 QToolTip {
     background: $tip_bg;
     color: $tip_fg;
-    border: none;
-    border-radius: 6px;
+    border: 1px solid $border_strong;
+    border-radius: 2px;
     padding: 6px 9px;
 }
 
@@ -182,22 +187,22 @@ QToolTip {
 QFrame[class="card"] {
     background: $surface;
     border: 1px solid $border;
-    border-radius: 12px;
+    border-radius: 2px;
 }
 QFrame[class="soft"] {
     background: $surface_alt;
-    border: none;
-    border-radius: 10px;
+    border: 1px solid $border;
+    border-radius: 2px;
 }
 QFrame#topbar {
     background: $surface;
     border: none;
-    border-bottom: 1px solid $border;
+    border-bottom: 2px solid $accent_soft_border;
 }
 QFrame#sidebar {
     background: $sidebar;
     border: 1px solid $border;
-    border-radius: 12px;
+    border-radius: 2px;
 }
 
 /* ============================ 文字 ============================ */
@@ -226,12 +231,12 @@ QLabel[class="hint"] {
 QLabel[class="status-ok"]  { color: $success; font-weight: 600; background: transparent; }
 QLabel[class="status-err"] { color: $danger;  font-weight: 600; background: transparent; }
 
-/* 状态徽标 */
+/* 状态徽标（锐利切角，明日方舟式标签） */
 QLabel[class="badge"] {
     background: $accent_soft;
     color: $accent_text;
     border: 1px solid $accent_soft_border;
-    border-radius: 10px;
+    border-radius: 2px;
     padding: 3px 11px;
     font-size: 12px;
     font-weight: 600;
@@ -240,7 +245,7 @@ QLabel[class="badge-idle"] {
     background: $surface_alt;
     color: $text_dim;
     border: 1px solid $border;
-    border-radius: 10px;
+    border-radius: 2px;
     padding: 3px 11px;
     font-size: 12px;
     font-weight: 600;
@@ -249,7 +254,7 @@ QLabel[class="badge-ok"] {
     background: $success_soft;
     color: $success;
     border: 1px solid transparent;
-    border-radius: 10px;
+    border-radius: 2px;
     padding: 3px 11px;
     font-size: 12px;
     font-weight: 600;
@@ -258,7 +263,7 @@ QLabel[class="badge-warn"] {
     background: $warn_soft;
     color: $warn;
     border: 1px solid transparent;
-    border-radius: 10px;
+    border-radius: 2px;
     padding: 3px 11px;
     font-size: 12px;
     font-weight: 600;
@@ -267,7 +272,7 @@ QLabel[class="badge-err"] {
     background: $danger_soft;
     color: $danger;
     border: 1px solid transparent;
-    border-radius: 10px;
+    border-radius: 2px;
     padding: 3px 11px;
     font-size: 12px;
     font-weight: 600;
@@ -277,7 +282,7 @@ QLabel[class="badge-err"] {
 QPushButton {
     background: $surface;
     border: 1px solid $border_strong;
-    border-radius: 8px;
+    border-radius: 2px;
     padding: 7px 16px;
     color: $text;
 }
@@ -334,7 +339,7 @@ QPushButton[class="icon"] {
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit, QPlainTextEdit {
     background: $surface;
     border: 1px solid $border_strong;
-    border-radius: 8px;
+    border-radius: 2px;
     padding: 7px 11px;
     selection-background-color: $accent;
     selection-color: $on_accent;
@@ -349,7 +354,7 @@ QDoubleSpinBox:disabled, QTimeEdit:disabled, QPlainTextEdit:disabled {
     color: $text_muted;
 }
 QLineEdit[class="search"] {
-    border-radius: 10px;
+    border-radius: 2px;
     padding: 9px 14px;
     font-size: 13px;
 }
@@ -370,7 +375,7 @@ QComboBox::down-arrow {
 QComboBox QAbstractItemView {
     background: $surface;
     border: 1px solid $border_strong;
-    border-radius: 8px;
+    border-radius: 2px;
     selection-background-color: $accent_soft;
     selection-color: $accent_text;
     padding: 4px;
@@ -378,7 +383,7 @@ QComboBox QAbstractItemView {
 QComboBox QAbstractItemView::item {
     min-height: 28px;
     padding: 4px 9px;
-    border-radius: 6px;
+    border-radius: 2px;
 }
 
 QSpinBox::up-button, QSpinBox::down-button,
@@ -412,7 +417,7 @@ QCheckBox::indicator {
     width: 17px;
     height: 17px;
     border: 1px solid $border_strong;
-    border-radius: 5px;
+    border-radius: 2px;
     background: $surface;
 }
 QCheckBox::indicator:hover    { border-color: $accent; }
@@ -424,7 +429,8 @@ QCheckBox::indicator:checked  {
 QCheckBox::indicator:checked:hover { background: $accent_hover; border-color: $accent_hover; }
 QCheckBox::indicator:disabled { background: $surface_alt; border-color: $border; }
 
-/* ========================== 侧边导航 ========================== */
+/* ========================== 侧边导航 ==========================
+   明日方舟选中态：左侧强调条 + 主色文字，而非整块填充。 */
 QListWidget#nav, QListWidget#subnav {
     background: transparent;
     border: none;
@@ -433,14 +439,16 @@ QListWidget#nav, QListWidget#subnav {
 }
 QListWidget#nav::item {
     height: 38px;
-    padding-left: 8px;
+    padding-left: 10px;
     margin: 2px 4px;
-    border-radius: 9px;
+    border-left: 2px solid transparent;
+    border-radius: 0px;
     color: $text_dim;
 }
 QListWidget#nav::item:hover       { background: $surface_alt; color: $text; }
 QListWidget#nav::item:selected    {
     background: $accent_soft;
+    border-left: 2px solid $accent;
     color: $accent_text;
     font-weight: 600;
 }
@@ -448,15 +456,17 @@ QListWidget#nav::item:selected:hover { background: $accent_soft; color: $accent_
 
 QListWidget#subnav::item {
     height: 34px;
-    padding-left: 8px;
+    padding-left: 10px;
     margin: 2px 4px;
-    border-radius: 8px;
+    border-left: 2px solid transparent;
+    border-radius: 0px;
     color: $text_dim;
     font-size: 12.5px;
 }
 QListWidget#subnav::item:hover    { background: $surface_alt; color: $text; }
 QListWidget#subnav::item:selected {
     background: $accent_soft;
+    border-left: 2px solid $accent;
     color: $accent_text;
     font-weight: 600;
 }
@@ -475,7 +485,7 @@ QTabBar {
 QTabBar::tab {
     background: transparent;
     border: none;
-    border-radius: 8px;
+    border-radius: 2px;
     padding: 7px 16px;
     margin-right: 4px;
     color: $text_dim;
@@ -495,7 +505,7 @@ QTableWidget {
     background: $surface;
     alternate-background-color: $surface_alt;
     border: 1px solid $border;
-    border-radius: 10px;
+    border-radius: 2px;
     gridline-color: $separator;
     selection-background-color: $accent_soft;
     selection-color: $accent_text;
@@ -513,7 +523,7 @@ QHeaderView::section {
     background: $surface_alt;
     color: $text_dim;
     border: none;
-    border-bottom: 1px solid $border;
+    border-bottom: 1px solid $border_strong;
     border-right: 1px solid $separator;
     padding: 9px 10px;
     font-size: 12px;
@@ -524,7 +534,7 @@ QHeaderView::section:hover { color: $text; }
 QTableCornerButton::section {
     background: $surface_alt;
     border: none;
-    border-bottom: 1px solid $border;
+    border-bottom: 1px solid $border_strong;
 }
 
 /* ========================== 日历（日期选择器） ==========================
@@ -556,7 +566,7 @@ QCalendarWidget QToolButton {
     color: $text;
     background: transparent;
     border: none;
-    border-radius: 6px;
+    border-radius: 2px;
     padding: 4px 8px;
 }
 QCalendarWidget QToolButton:hover { background: $surface_hover; }
@@ -567,7 +577,7 @@ QPlainTextEdit[class="log"] {
     background: $log_bg;
     color: $log_fg;
     border: 1px solid $border;
-    border-radius: 10px;
+    border-radius: 2px;
     font-family: "Cascadia Mono", "Cascadia Code", "Consolas", "Microsoft YaHei UI", monospace;
     font-size: 12px;
     padding: 10px 12px;
@@ -579,13 +589,13 @@ QPlainTextEdit[class="log"] {
 QProgressBar {
     background: $surface_alt;
     border: none;
-    border-radius: 3px;
+    border-radius: 1px;
     height: 5px;
     text-align: center;
 }
 QProgressBar::chunk {
     background: $accent;
-    border-radius: 3px;
+    border-radius: 1px;
 }
 
 /* ========================== 滚动条 ========================== */
@@ -597,7 +607,7 @@ QScrollBar:vertical {
 }
 QScrollBar::handle:vertical {
     background: $scroll;
-    border-radius: 5px;
+    border-radius: 2px;
     min-height: 34px;
 }
 QScrollBar::handle:vertical:hover { background: $scroll_hover; }
@@ -615,7 +625,7 @@ QScrollBar:horizontal {
 }
 QScrollBar::handle:horizontal {
     background: $scroll;
-    border-radius: 5px;
+    border-radius: 2px;
     min-width: 34px;
 }
 QScrollBar::handle:horizontal:hover { background: $scroll_hover; }
@@ -639,7 +649,7 @@ QStatusBar QLabel { color: $text_dim; font-size: 12px; background: transparent; 
 QGroupBox {
     background: $surface;
     border: 1px solid $border;
-    border-radius: 12px;
+    border-radius: 2px;
     margin-top: 14px;
     padding: 14px 12px 12px 12px;
     font-weight: 600;
@@ -649,19 +659,19 @@ QGroupBox::title {
     subcontrol-position: top left;
     left: 14px;
     padding: 0 6px;
-    color: $text;
+    color: $accent_text;
 }
 
 /* ========================== 菜单 ========================== */
 QMenu {
     background: $surface;
     border: 1px solid $border_strong;
-    border-radius: 8px;
+    border-radius: 2px;
     padding: 5px;
 }
 QMenu::item {
     padding: 7px 22px 7px 12px;
-    border-radius: 6px;
+    border-radius: 2px;
     color: $text;
 }
 QMenu::item:selected { background: $accent_soft; color: $accent_text; }
@@ -696,8 +706,8 @@ QWizard QPushButton:default:pressed, QMessageBox QPushButton:default:pressed {
 }
 QFrame[class="step-badge"] {
     background: $accent_soft;
-    border: none;
-    border-radius: 14px;
+    border: 1px solid $accent_soft_border;
+    border-radius: 2px;
 }
 
 /* ========================== 其它 ========================== */
@@ -706,7 +716,7 @@ QSplitter::handle { background: $separator; }
 """
 
 
-def build_qss(mode: str = "light") -> str:
+def build_qss(mode: str = "dark") -> str:
     """按给定模式渲染完整样式表。"""
     t = dict(tokens(mode))
     t["check_white"] = asset("check", t["on_accent"])
@@ -715,7 +725,7 @@ def build_qss(mode: str = "light") -> str:
     return string.Template(_QSS).safe_substitute(**t)
 
 
-def apply_theme(app, mode: str = "light") -> str:
+def apply_theme(app, mode: str = "dark") -> str:
     """把主题应用到整个 QApplication，返回实际生效的模式。"""
     resolved = resolve_mode(mode)
     _CURRENT["mode"] = resolved

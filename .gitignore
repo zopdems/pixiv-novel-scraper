@@ -37,3 +37,7 @@ _sf_parse.py
 package.json
 .env
 .env.*
+
+# 本地备份 / 旧产物残留目录（勿提交）
+.backup_*/
+_old_*/

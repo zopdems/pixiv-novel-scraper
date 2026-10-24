@@ -108,9 +108,17 @@ class RebuildMdWorker(QThread):
 
     def run(self):
         try:
-            report = rebuild_md_indexes(self.settings, self.db, self.logger,
-                                        progress_cb=lambda d, t, a: (
-                                            None if self._stop else self.progress.emit(d, t, a)))
+            # 回调返回 False 让 rebuild_md_indexes 提前收尾：
+            # 只让回调「不 emit」的话循环仍会跑完全部作者，点停止等于没用。
+            def _cb(done, total, author_id):
+                if self._stop:
+                    return False
+                self.progress.emit(done, total, author_id)
+                return True
+
+            report = rebuild_md_indexes(self.settings, self.db, self.logger, progress_cb=_cb)
+            if self._stop:
+                report["stopped"] = True
         except Exception as e:
             self.logger.error("索引重建异常：%s", e, exc_info=True)
             report = {"authors": 0, "written": 0, "failed": 0, "error": str(e)}
@@ -169,7 +177,7 @@ class AuthorCheckWorker(QThread):
                     if name:
                         cur = self.db.get_author(aid, kind=kind) or {}
                         if name != (cur.get("author_name") or ""):
-                            self.db.update_author_name(aid, name)
+                            self.db.update_author_name(aid, name, kind=kind)
                             result["renamed"].append(
                                 {"aid": aid, "kind": kind,
                                  "old": cur.get("author_name") or "", "name": name})

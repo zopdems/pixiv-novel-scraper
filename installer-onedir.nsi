@@ -3,9 +3,17 @@
 ; 目录版（onedir）安装包：把 dist\PixivNovelScraper-OneDir\ 整个目录装进去。
 ; 相比单文件版少了自解压 stub，杀毒软件启发式误报率通常更低，代价是安装体积更大。
 ; 前置：python -m PyInstaller --noconfirm PixivNovelScraper-onedir.spec
+;
+; 版本号唯一来源是 app/version.py；此处默认 1.4.5，可在命令行用
+;   makensis.exe -DVERSION=1.4.6 installer-onedir.nsi
+; 覆盖（见 build_exe.ps1 里已自动传入）。
+
+!ifndef VERSION
+  !define VERSION "1.4.5"
+!endif
 
 Name "Pixiv 小说自动抓取器（目录版）"
-OutFile "dist\PixivNovelScraper-Setup-v1.4.4-onedir.exe"
+OutFile "dist\PixivNovelScraper-Setup-v${VERSION}-onedir.exe"
 Unicode true
 RequestExecutionLevel user
 InstallDir "$LOCALAPPDATA\Programs\PixivNovelScraper"
@@ -29,7 +37,7 @@ Section "主程序（必需）" SecMain
     WriteUninstaller "$INSTDIR\Uninstall.exe"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayName" "Pixiv 小说自动抓取器"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayVersion" "1.4.4"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "DisplayVersion" "${VERSION}"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "Publisher" "pixiv-novel-scraper"
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "NoModify" 1
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\PixivNovelScraper" "NoRepair" 1

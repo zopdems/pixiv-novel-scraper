@@ -1,3 +1,4 @@
+import random
 import re
 import time
 
@@ -110,9 +111,13 @@ class PixivClient:
 
     def _throttle(self):
         interval = max(0.5, float(self.settings.request_interval))
+        # 每次请求间隔叠加 ±20% 随机抖动：固定节奏更容易被风控识别为机器人，
+        # 抖动能打散请求的机械规律，同时对总速率影响很小。
+        jitter = interval * random.uniform(-0.2, 0.2)
+        effective = max(0.3, interval + jitter)
         elapsed = time.monotonic() - self._last_request_at
-        if elapsed < interval:
-            self._sleep(interval - elapsed)
+        if elapsed < effective:
+            self._sleep(effective - elapsed)
         self._last_request_at = time.monotonic()
 
     def request(self, method: str, url: str, **kwargs):

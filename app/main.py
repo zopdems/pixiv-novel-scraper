@@ -1,4 +1,5 @@
 import sys
+import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
@@ -69,12 +70,25 @@ def main():
         int(getattr(settings, "catch_up_window_minutes", 0) or 0),
     )
 
+    # 分批抓取的续抓状态：记录「上一轮因达到上限而截断」的完成时间，
+    # 供定时 tick 判断间隔是否已到，从而自动接着抓下一批。
+    batch_state = {"truncated_at": None}
+
     def notify_report(report):
         if getattr(report, "auth_expired", False):
             tray.notify("Cookie 已失效", "请重新导入登录 Cookie，否则定时抓取会持续失败")
-        elif report.aborted_reason:
+        elif getattr(report, "aborted_reason", "") and not getattr(report, "truncated", False):
             tray.notify("抓取任务异常", report.aborted_reason)
+        elif getattr(report, "truncated", False):
+            batch_state["truncated_at"] = time.time()
+            interval = int(getattr(settings, "batch_interval_minutes", 30) or 30)
+            tray.notify(
+                "分批抓取",
+                f"本轮已下载 {getattr(report, 'new_count', 0) + getattr(report, 'updated_count', 0)} 部，"
+                f"约 {interval} 分钟后自动续抓剩余作品",
+            )
         else:
+            batch_state["truncated_at"] = None
             tray.notify(
                 "抓取完成",
                 f"新增 {report.new_count} 部，更新 {report.updated_count} 部，失败 {report.failed_count} 部",
@@ -125,7 +139,29 @@ def main():
             elif busy and rank_scheduler.pending_today():
                 logger.info("排行榜定时任务等待：已有任务进行中，稍后空闲再触发")
 
-        if not scheduler.should_run():
+        # ---- 分批续抓：上一轮因达到单轮上限而截断，间隔到了自动接着抓 ----
+        if batch_state["truncated_at"] is not None:
+            interval = int(getattr(settings, "batch_interval_minutes", 30) or 30)
+            elapsed_min = (time.time() - batch_state["truncated_at"]) / 60.0
+            if window.worker and window.worker.isRunning():
+                pass  # 还在抓，不动
+            elif elapsed_min >= interval:
+                if not load_cookie():
+                    tray.notify("无法续抓", "未配置登录 Cookie")
+                    batch_state["truncated_at"] = None
+                elif not db.list_authors(enabled_only=True):
+                    logger.info("续抓跳过：作者列表为空")
+                    batch_state["truncated_at"] = None
+                else:
+                    logger.info("分批续抓触发（距上一轮 %.0f 分钟）", elapsed_min)
+                    batch_state["truncated_at"] = None  # 先清，避免本轮抓取期间重复触发
+                    window.start_fetch()
+            return  # 有续抓在排，本 tick 不再处理每日定时
+
+        # 先判断「今天是否还有待跑的定时任务」但别消耗触发机会：
+        # should_run() 一旦调用就记下今天已跑过，若后面发现缺 Cookie / 名单为空
+        # 而 return，这次机会就被白白吃掉，用户补上 Cookie 后当天也不会再补跑。
+        if not scheduler.pending_today():
             return
         if not load_cookie():
             tray.notify("无法开始抓取", "未配置登录 Cookie，请在设置页导入")
@@ -136,7 +172,10 @@ def main():
             logger.info("定时任务跳过：作者列表为空")
             return
         if window.worker and window.worker.isRunning():
-            logger.info("定时任务跳过：已有任务进行中")
+            logger.info("定时任务跳过：已有任务进行中，稍后空闲再触发")
+            return
+        # 确认能真的开工，再消耗今天的触发机会
+        if not scheduler.should_run():
             return
         logger.info("定时任务触发（%s）", settings.fetch_time)
         window.start_fetch()

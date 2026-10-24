@@ -10,6 +10,7 @@
 import json
 import os
 import sqlite3
+import threading
 import time
 
 RANK_DB_VERSION = 3
@@ -139,32 +140,71 @@ class RankDatabase:
         self.path = path
         self.logger = logger
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._migrate()
+        # 与 index.db 同理：榜单抓取在 worker 线程写，界面在主线程读，
+        # 共享单条连接会并发 commit 报错，改为每线程一条 + WAL。
+        self._local = threading.local()
+        self._tls_lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._migrated = False
+        self._conn = self._connection()
 
-    def close(self):
+    # ---------------------------------------------------------- 连接管理
+    def _connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
+        conn.row_factory = sqlite3.Row
         try:
-            self._conn.close()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
         except Exception:
             pass
+        self._local.conn = conn
+        with self._tls_lock:
+            if not self._migrated:
+                self._migrate_on(conn)
+                self._migrated = True
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        return self._connection()
+
+    def close(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
+        main_conn = getattr(self, "_conn", None)
+        if main_conn is not None:
+            try:
+                main_conn.close()
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- 迁移
     def _migrate(self):
+        """兼容旧调用：在默认连接上执行迁移。"""
+        self._connection()
+
+    def _migrate_on(self, conn: sqlite3.Connection):
         try:
-            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
         except Exception:
             version = 0
         if version < 1:
-            self._conn.executescript(_SCHEMA_V1)
+            conn.executescript(_SCHEMA_V1)
         if version < 2:
-            self._conn.executescript(_SCHEMA_V2)
+            conn.executescript(_SCHEMA_V2)
         if version < 3:
-            self._conn.executescript(_SCHEMA_V3)
+            conn.executescript(_SCHEMA_V3)
         if version < RANK_DB_VERSION:
-            self._conn.execute(f"PRAGMA user_version = {RANK_DB_VERSION}")
-            self._conn.commit()
+            conn.execute(f"PRAGMA user_version = {RANK_DB_VERSION}")
+            conn.commit()
 
     @staticmethod
     def _now() -> str:
@@ -177,7 +217,8 @@ class RankDatabase:
         同一 (mode, rank_date) 重复调用会覆盖当次记录，便于补抓修正。
         """
         now = self._now()
-        cur = self._conn.cursor()
+        conn = self._connection()
+        cur = conn.cursor()
         cur.execute("DELETE FROM rank_entries WHERE mode=? AND rank_date=?", (mode, rank_date))
         cur.execute("DELETE FROM rank_snapshots WHERE mode=? AND rank_date=?", (mode, rank_date))
         cur.execute(
@@ -214,12 +255,13 @@ class RankDatabase:
                 " VALUES(?,?,?,?,?)",
                 (mode, rank_date, int(it.get("rank") or 0), work_id,
                  int(it.get("bookmark_count") or 0)))
-        self._conn.commit()
+        conn.commit()
         return len(items)
 
     # ---------------------------------------------------------------- 查询
     def dates(self, mode: str, limit: int = 60) -> list:
-        rows = self._conn.execute(
+        conn = self._connection()
+        rows = conn.execute(
             "SELECT rank_date FROM rank_snapshots WHERE mode=?"
             " ORDER BY rank_date DESC LIMIT ?", (mode, limit)).fetchall()
         return [r[0] for r in rows]
@@ -234,7 +276,8 @@ class RankDatabase:
         派生字段：days_on_board（在榜天数，含当天）、rank_delta（较上一次名次变化，
         负数为上升）、bookmark_delta（较上一次收藏增量）。
         """
-        rows = self._conn.execute(
+        conn = self._connection()
+        rows = conn.execute(
             "SELECT e.rank, e.work_id, w.title, w.author_id, w.author_name,"
             " w.series_id, w.series_title, w.word_count, w.reading_time,"
             " e.bookmark_count, w.x_restrict, w.ai_type, w.genre, w.tags,"
@@ -245,19 +288,19 @@ class RankDatabase:
 
         # 上一次快照（用于算变化）
         prev_date = ""
-        for d in self._conn.execute(
+        for d in conn.execute(
                 "SELECT rank_date FROM rank_snapshots WHERE mode=? AND rank_date<?"
                 " ORDER BY rank_date DESC LIMIT 1", (mode, rank_date)).fetchall():
             prev_date = d[0]
         prev = {}
         if prev_date:
-            for r in self._conn.execute(
+            for r in conn.execute(
                     "SELECT work_id, rank, bookmark_count FROM rank_entries"
                     " WHERE mode=? AND rank_date=?", (mode, prev_date)).fetchall():
                 prev[r["work_id"]] = (r["rank"], r["bookmark_count"])
 
         board = {}
-        for r in self._conn.execute(
+        for r in conn.execute(
                 "SELECT work_id, COUNT(DISTINCT rank_date) AS n FROM rank_entries"
                 " WHERE mode=? AND rank_date<=? GROUP BY work_id",
                 (mode, rank_date)).fetchall():
@@ -287,7 +330,8 @@ class RankDatabase:
             params.append(mode)
         sql += " ORDER BY rank_date DESC, mode LIMIT ?"
         params.append(limit)
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        conn = self._connection()
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     def authors(self, limit: int = 1000) -> list:
         """汇总榜单里出现过的作者（用于「哪些还没加入名单」）。
@@ -295,7 +339,8 @@ class RankDatabase:
         字段：author_id / author_name / works（不同作品数）/ entries（累计上榜次数）
              / best_rank（历史最高名次）/ last_date（最近上榜日期）
         """
-        rows = self._conn.execute(
+        conn = self._connection()
+        rows = conn.execute(
             "SELECT w.author_id AS author_id, w.author_name AS author_name,"
             " COUNT(DISTINCT w.work_id) AS works, COUNT(e.id) AS entries,"
             " MIN(e.rank) AS best_rank, MAX(e.rank_date) AS last_date"
@@ -308,7 +353,8 @@ class RankDatabase:
     def snapshot_stats(self) -> dict:
         """每个榜单的快照数量与最新日期。"""
         out = {}
-        for r in self._conn.execute(
+        conn = self._connection()
+        for r in conn.execute(
                 "SELECT mode, COUNT(*) AS n, MAX(rank_date) AS latest FROM rank_snapshots"
                 " GROUP BY mode").fetchall():
             out[r["mode"]] = {"snapshots": r["n"], "latest": r["latest"]}
@@ -316,7 +362,8 @@ class RankDatabase:
 
     def total_entries(self) -> int:
         try:
-            return int(self._conn.execute(
+            conn = self._connection()
+            return int(conn.execute(
                 "SELECT COUNT(*) FROM rank_entries").fetchone()[0])
         except Exception:
             return 0
@@ -324,7 +371,8 @@ class RankDatabase:
     # ---------------------------------------------------------------- 抓取流水
     def add_run(self, **kw) -> int:
         """记录一轮抓取。失败不影响主流程（调用方已兜异常）。"""
-        cur = self._conn.cursor()
+        conn = self._connection()
+        cur = conn.cursor()
         cur.execute(
             "INSERT INTO rank_runs(started_at, finished_at, rank_date, date_from,"
             " source, modes, days, days_ok, collected, downloaded, skipped, failed,"
@@ -352,7 +400,7 @@ class RankDatabase:
         cur.execute(
             "DELETE FROM rank_runs WHERE id NOT IN"
             " (SELECT id FROM rank_runs ORDER BY id DESC LIMIT ?)", (self.RUN_KEEP,))
-        self._conn.commit()
+        conn.commit()
         return rid
 
     def append_run_txt(self, **kw) -> str:
@@ -397,13 +445,15 @@ class RankDatabase:
 
     def runs(self, limit: int = 200) -> list:
         """最近若干轮抓取，新的在前。"""
-        rows = self._conn.execute(
+        conn = self._connection()
+        rows = conn.execute(
             "SELECT * FROM rank_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
     def run_totals(self) -> dict:
         """流水累计：跑了几轮、收录多少、新下载多少、失败多少、总耗时。"""
-        r = self._conn.execute(
+        conn = self._connection()
+        r = conn.execute(
             "SELECT COUNT(*) AS rounds,"
             " COALESCE(SUM(collected),0) AS collected,"
             " COALESCE(SUM(downloaded),0) AS downloaded,"
@@ -414,10 +464,11 @@ class RankDatabase:
 
     def clear_runs(self) -> int:
         """清空抓取历史（只清流水，不动榜单数据）。"""
-        cur = self._conn.cursor()
+        conn = self._connection()
+        cur = conn.cursor()
         cur.execute("DELETE FROM rank_runs")
         n = cur.rowcount or 0
-        self._conn.commit()
+        conn.commit()
         return n
 
     def export_runs_csv(self, path: str, limit: int = 500) -> int:
@@ -503,7 +554,8 @@ class RankDatabase:
         title = ""
         author = ""
         try:
-            r = self._conn.execute(
+            conn = self._connection()
+            r = conn.execute(
                 "SELECT title, author_name FROM rank_works WHERE work_id=?",
                 (work_id,)).fetchone()
             if r:
@@ -522,12 +574,13 @@ class RankDatabase:
 
     def prune_before(self, rank_date: str) -> int:
         """删除指定日期之前的快照与记录（不含该日期），返回删除的快照数。"""
-        cur = self._conn.cursor()
+        conn = self._connection()
+        cur = conn.cursor()
         cur.execute("DELETE FROM rank_entries WHERE rank_date<?", (rank_date,))
         cur.execute("DELETE FROM rank_snapshots WHERE rank_date<?", (rank_date,))
         n = cur.rowcount or 0
         # 清理已无任何上榜记录的作品
         cur.execute("DELETE FROM rank_works WHERE work_id NOT IN"
                     " (SELECT work_id FROM rank_entries)")
-        self._conn.commit()
+        conn.commit()
         return n

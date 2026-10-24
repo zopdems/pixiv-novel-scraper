@@ -1,5 +1,6 @@
 import html
 import os
+import tempfile
 
 from ebooklib import epub
 
@@ -138,4 +139,16 @@ def build_epub(meta, chapters, images: dict, out_path: str, cover_bytes: bytes =
     book.add_item(epub.EpubNav())
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    epub.write_epub(out_path, book)
+    # 原子写：先写临时文件再替换，避免打包到一半被中断留下损坏的 epub
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(out_path) or ".",
+                                    prefix=".tmp_", suffix=".epub")
+    os.close(fd)
+    try:
+        epub.write_epub(tmp_path, book)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise

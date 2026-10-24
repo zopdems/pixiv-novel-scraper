@@ -9,7 +9,7 @@ from ..config import Settings
 from ..pixiv import api
 from ..pixiv.client import AuthExpiredError, PixivClient, PixivRequestError, RiskControlError
 from ..pixiv.markup import convert_novel_markup
-from . import epub_exporter, md_index, paths
+from . import epub_exporter, md_index, paths, utils
 from .db import (DISABLE_REASON_DEACTIVATED, SERIES_RECHECK_DAYS, Database)
 from .epub_exporter import build_epub
 from .md_index import write_author_md, write_illust_md
@@ -32,6 +32,7 @@ class RunReport:
     illust_deleted: int = 0
     aborted_reason: str = ""
     auth_expired: bool = False       # 登录失效（Cookie 过期）导致中止
+    truncated: bool = False          # 已达「单轮下载上限」，本轮提前收尾，仍有剩余待续抓
     per_author: dict = field(default_factory=dict)
 
 
@@ -46,6 +47,9 @@ class ScraperEngine:
         self.client = PixivClient(settings, cookie, logger, stop_event=self._stop_event)
         self.cookie = cookie or ""
         self.report = RunReport()
+        # 分批抓取：本轮已成功下载的作品数（小说 + 图片合计）
+        self._batch_downloaded = 0
+        self._batch_limit = self._cfg_int("batch_limit", 0)
         # 各子系统的可选项（缺省即历史行为）
         self.popts = paths.output_opts(settings)
         self.eopts = epub_exporter.epub_opts(settings)
@@ -135,16 +139,32 @@ class ScraperEngine:
                 else:
                     self.logger.info("按设置跳过失败队列重试")
                 self._recheck_disabled_authors()
-                for author in self.db.list_authors(enabled_only=True, kind="novel"):
+                novel_authors = self.db.list_authors(enabled_only=True, kind="novel")
+                illust_authors = self.db.list_authors(enabled_only=True, kind="illust")
+                total_authors = len(novel_authors) + len(illust_authors)
+                done_authors = 0
+                self._emit("run_scope", total=total_authors)
+                for author in novel_authors:
                     self._guard_failures()
                     self._process_author(author)
-                for author in self.db.list_authors(enabled_only=True, kind="illust"):
+                    done_authors += 1
+                    self._emit("run_progress", done=done_authors, total=total_authors)
+                for author in illust_authors:
                     self._guard_failures()
                     self._process_illust_author(author)
+                    done_authors += 1
+                    self._emit("run_progress", done=done_authors, total=total_authors)
             except AuthExpiredError:
                 self.report.aborted_reason = "登录已失效，请重新导入 Cookie"
                 self.report.auth_expired = True
                 self.logger.error(self.report.aborted_reason)
+            except _BatchLimitReached:
+                self.report.truncated = True
+                # 异常冒出时正处理的那位作者还没走到尾部汇总，这里把未合并的补上，
+                # 保证「触发上限那部作品」的计数不丢、author_done 事件也照发。
+                self._merge_unfinished_author_stats()
+                self.logger.info(
+                    "已达本轮下载上限（%d 部），提前收尾，剩余作品待续抓", self._batch_limit)
             except _AbortRun:
                 pass
         finally:
@@ -189,6 +209,18 @@ class ScraperEngine:
             self.logger.error(self.report.aborted_reason)
             raise _AbortRun()
 
+    def _register_download(self):
+        """每成功下载一部作品调用一次；达到单轮上限时抛出 _BatchLimitReached。
+
+        分批抓取的核心钩子：上限只在「本轮」内生效，抛出后由 run() 捕获，
+        标记 truncated 并提前收尾，剩余作品留给下一轮（定时器按间隔自动续抓）。
+        """
+        if self._batch_limit <= 0:
+            return
+        self._batch_downloaded += 1
+        if self._batch_downloaded >= self._batch_limit:
+            raise _BatchLimitReached()
+
     def _handle_author_missing(self, aid: str, author: dict, kind: str = "novel") -> None:
         """作者账号已注销 / 不存在时，按 author_404_action 处理。"""
         action = str(self._cfg("author_404_action", "disable"))
@@ -228,7 +260,8 @@ class ScraperEngine:
             self._handle_author_missing(aid, author, kind)
             return False
         if name and name != (author.get("author_name") or ""):
-            self.db.update_author_name(aid, name)
+            # 必须带 kind：同一作者可同时在小说与插画名单，不带会连另一名单一起改
+            self.db.update_author_name(aid, name, kind=kind)
             author["author_name"] = name
         return True
 
@@ -237,9 +270,15 @@ class ScraperEngine:
         if not queue:
             return
         self.logger.info("优先重试失败队列：%d 部", len(queue))
+        # 重试的结果必须汇总进 report，否则界面显示「失败 0」而实际仍有失败
+        stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0}
         for novel in queue:
             self._guard_failures()
-            self._process_novel(novel["novel_id"], novel["author_id"], is_retry=True)
+            self._process_novel(novel["novel_id"], novel["author_id"], is_retry=True, stat=stat)
+        self.report.new_count += stat["new"]
+        self.report.updated_count += stat["updated"]
+        self.report.skipped_count += stat["skipped"]
+        self.report.failed_count += stat["failed"]
 
     def _process_author(self, author: dict):
         aid = author["author_id"]
@@ -252,14 +291,14 @@ class ScraperEngine:
         try:
             if author.get("pending_validate") or not author.get("author_name"):
                 if not self._ensure_author_alive(aid, author, "novel"):
-                    self.report.failed_count += stat["failed"]
+                    self._finish_author_stat(stat, aid)
                     return
             remote_ids, _ = api.get_user_profile_ids(self.client, aid)
             remote_ids = set(remote_ids)
             if not remote_ids:
                 # 远端零作品：需区分「已注销」与「还没发过作品的新账号」
                 if not self._ensure_author_alive(aid, author, "novel"):
-                    self.report.failed_count += stat["failed"]
+                    self._finish_author_stat(stat, aid)
                     return
         except AuthExpiredError:
             raise
@@ -269,12 +308,12 @@ class ScraperEngine:
             else:
                 stat["failed"] += 1
                 self.logger.error("作者 %s 作品列表获取失败：%s", aid, e)
-            self.report.failed_count += stat["failed"]
+            self._finish_author_stat(stat, aid)
             return
         except Exception as e:
             stat["failed"] += 1
             self.logger.error("作者 %s 作品列表获取失败：%s", aid, e)
-            self.report.failed_count += stat["failed"]
+            self._finish_author_stat(stat, aid)
             return
 
         local_map = {n["novel_id"]: n for n in self.db.novels_by_author(aid)}
@@ -345,7 +384,7 @@ class ScraperEngine:
         if series_ids and self.db.deleted_series_ids(aid).issuperset(series_ids):
             self._guard_failures()
             if not self._ensure_author_alive(aid, author, "novel"):
-                self.report.failed_count += stat["failed"]
+                self._finish_author_stat(stat)
                 return
 
         if remote_name and remote_name != (author.get("author_name") or ""):
@@ -353,27 +392,30 @@ class ScraperEngine:
             self.db.update_author_name(aid, remote_name)
             if self._cfg("author_rename_migrate", True):
                 self.logger.info("迁移文件至新目录")
-                self._migrate_filenames()
-                self._migrate_illust_paths()
+                # 只有这位作者改了名，只迁移他的文件即可
+                self._migrate_filenames(aid)
+                self._migrate_illust_paths(aid)
             else:
                 self.logger.info("按设置跳过目录迁移，已下载文件保留在原目录")
 
         self.db.touch_author_fetch(aid, kind="novel")
         self._refresh_author_md(aid, stat)
-        self.report.new_count += stat["new"]
-        self.report.updated_count += stat["updated"]
-        self.report.skipped_count += stat["skipped"]
-        self.report.failed_count += stat["failed"]
-        self.report.deleted_count += stat["deleted"]
-        self.report.illust_new += stat["illust_new"]
-        self.report.illust_updated += stat["illust_updated"]
-        self.report.illust_skipped += stat["illust_skipped"]
-        self.report.illust_failed += stat["illust_failed"]
-        self.report.illust_deleted += stat["illust_deleted"]
-        self._emit("author_done", author_id=aid, **stat)
+        self._merge_stat(stat, aid)
+        self._emit("author_done", author_id=aid, **{k: v for k, v in stat.items() if not k.startswith("_")})
 
-    def _migrate_filenames(self):
-        for rec in self.db.ok_novels():
+    def _migrate_filenames(self, author_id: str = None):
+        """按当前命名规则重命名 EPUB。
+
+        author_id 为空时处理全部作者（抓取开始前的例行对齐）；
+        指定时只处理该作者 —— 抓取途中某位作者改昵称时就是这种情况，
+        没必要为此把整张作品表再扫一遍。
+        """
+        if author_id:
+            recs = [r for r in self.db.novels_by_author(author_id)
+                    if r.get("status") == Status.OK]
+        else:
+            recs = self.db.ok_novels()
+        for rec in recs:
             old = rec.get("local_path") or ""
             if not old or not os.path.exists(old):
                 continue
@@ -399,6 +441,7 @@ class ScraperEngine:
         stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0, "deleted": 0,
                 "illust_new": 0, "illust_updated": 0, "illust_skipped": 0,
                 "illust_failed": 0, "illust_deleted": 0}
+        self.report.per_author[aid] = stat
         self._emit("author_start", author_id=aid, author_name=author.get("author_name") or aid)
         try:
             if author.get("pending_validate") or not author.get("author_name"):
@@ -434,34 +477,78 @@ class ScraperEngine:
         remote_name = next((r["author_name"] for r in recs if r.get("author_name")), "")
         if remote_name and remote_name != (author.get("author_name") or ""):
             self.logger.info("作者 %s 昵称变更：%s -> %s", aid, author.get("author_name"), remote_name)
-            self.db.update_author_name(aid, remote_name)
+            self.db.update_author_name(aid, remote_name, kind="illust")
             if self._cfg("author_rename_migrate", True):
                 self.logger.info("迁移图片至新目录")
-                self._migrate_illust_paths()
-                self._migrate_filenames()
+                # 只有这位作者改了名，只迁移他的文件即可
+                self._migrate_illust_paths(aid)
+                self._migrate_filenames(aid)
             else:
                 self.logger.info("按设置跳过目录迁移，已下载图片保留在原目录")
 
         self.db.touch_author_fetch(aid, kind="illust")
         self._refresh_author_md(aid, stat)
         self._report_illust_stat(stat)
-        self._emit("author_done", author_id=aid, **stat)
+        self._emit("author_done", author_id=aid, **{k: v for k, v in stat.items() if not k.startswith("_")})
+
+    def _merge_stat(self, stat: dict, author_id: str = "") -> None:
+        """把单作者统计并入总报告（幂等，重复调用不会重复累计）。
+
+        正常完成、早退、分批截断三条路径都汇到这里；stat 带 _merged 标记，
+        异常打断后由 _merge_unfinished_author_stats 兜底补一次也不重复。
+        """
+        if stat.get("_merged"):
+            return
+        stat["_merged"] = True
+        self.report.new_count += stat.get("new", 0)
+        self.report.updated_count += stat.get("updated", 0)
+        self.report.skipped_count += stat.get("skipped", 0)
+        self.report.failed_count += stat.get("failed", 0)
+        self.report.deleted_count += stat.get("deleted", 0)
+        self.report.illust_new += stat.get("illust_new", 0)
+        self.report.illust_updated += stat.get("illust_updated", 0)
+        self.report.illust_skipped += stat.get("illust_skipped", 0)
+        self.report.illust_failed += stat.get("illust_failed", 0)
+        self.report.illust_deleted += stat.get("illust_deleted", 0)
+
+    def _merge_unfinished_author_stats(self):
+        """分批截断 / 异常打断时，把 per_author 里未合并的统计补进 report。"""
+        for aid, stat in self.report.per_author.items():
+            if not stat.get("_merged"):
+                self._merge_stat(stat, aid)
+
+    def _finish_author_stat(self, stat: dict, author_id: str = ""):
+        """把单作者统计并入总报告，并发 author_done 事件。
+
+        中途 return 的分支（账号已注销、列表获取失败等）也必须走这里：
+        只累加 failed 会丢掉其余计数，并且不发 author_done，
+        界面日志里该作者就像凭空消失了一样。
+        """
+        if not author_id:
+            author_id = stat.get("author_id", "")
+        self._merge_stat(stat, author_id)
+        try:
+            self._emit("author_done", author_id=author_id, **{k: v for k, v in stat.items() if not k.startswith("_")})
+        except Exception:
+            pass
 
     def _report_illust_stat(self, stat: dict):
-        self.report.illust_new += stat["illust_new"]
-        self.report.illust_updated += stat["illust_updated"]
-        self.report.illust_skipped += stat["illust_skipped"]
-        self.report.illust_failed += stat["illust_failed"]
-        self.report.illust_deleted += stat["illust_deleted"]
+        self._merge_stat(stat)
 
     def _illust_ext(self, rec: dict) -> str:
         old = rec.get("local_path") or ""
         ext = os.path.splitext(old)[1]
         return ext if ext else ".jpg"
 
-    def _migrate_illust_paths(self):
+    def _migrate_illust_paths(self, author_id: str = None):
+        """按当前命名规则迁移图片；author_id 存在时只处理该作者。"""
+        if author_id:
+            recs = [r for r in self.db.illusts_by_author(author_id)
+                    if r.get("status") == Status.OK]
+        else:
+            recs = self.db.ok_illusts()
         root = paths.illust_root(self.settings)
-        for rec in self.db.ok_illusts():
+        for rec in recs:
             old = rec.get("local_path") or ""
             if not old or not os.path.exists(old):
                 continue
@@ -602,8 +689,7 @@ class ScraperEngine:
                             pass
                 for idx, ext, blob in blobs:
                     fname = f"{illust_id}_p{idx}{ext}"
-                    with open(os.path.join(out_path, fname), "wb") as f:
-                        f.write(blob)
+                    utils.atomic_write_bytes(os.path.join(out_path, fname), blob)
             elif multipage:
                 # 平铺模式：多页直接放在作者目录下
                 parent = os.path.dirname(out_path)
@@ -619,15 +705,13 @@ class ScraperEngine:
                 first_file = ""
                 for idx, ext, blob in blobs:
                     fpath = os.path.join(parent, f"{prefix}{idx}{ext}")
-                    with open(fpath, "wb") as f:
-                        f.write(blob)
+                    utils.atomic_write_bytes(fpath, blob)
                     if idx == 0:
                         first_file = fpath
                 out_path = first_file or out_path
             else:
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                with open(out_path, "wb") as f:
-                    f.write(blobs[0][2])
+                utils.atomic_write_bytes(out_path, blobs[0][2])
             if self._cfg("replace_old_file", True):
                 if old_path and os.path.abspath(old_path) != os.path.abspath(out_path) and os.path.exists(old_path):
                     if os.path.isdir(old_path):
@@ -645,7 +729,10 @@ class ScraperEngine:
             self._emit("illust_done", illust_id=illust_id, title=meta.title, updated=is_update)
             self.logger.info("图片 %s《%s》（%d 页）%s", illust_id, meta.title, meta.page_count,
                              "更新完成" if is_update else "下载完成")
+            self._register_download()
         except AuthExpiredError:
+            raise
+        except _BatchLimitReached:
             raise
         except Exception as e:
             self.logger.error("图片 %s 处理失败：%s\n%s", illust_id, e, traceback.format_exc())
@@ -785,7 +872,10 @@ class ScraperEngine:
             stat["updated" if is_update else "new"] += 1
             self._emit("novel_done", novel_id=novel_id, title=meta.title, updated=is_update)
             self.logger.info("作品 %s《%s》%s", novel_id, meta.title, "重打包完成" if is_update else "下载完成")
+            self._register_download()
         except AuthExpiredError:
+            raise
+        except _BatchLimitReached:
             raise
         except Exception as e:
             self.logger.error("作品 %s 处理失败：%s\n%s", novel_id, e, traceback.format_exc())
@@ -878,6 +968,10 @@ class _AbortRun(Exception):
     pass
 
 
+class _BatchLimitReached(Exception):
+    """单轮下载达到上限，提前收尾（不是错误，是用户配置的分批抓取）。"""
+
+
 def refresh_author_md(settings, db, logger, author_id: str, run_stat: dict = None,
                       popts: dict = None, mopts: dict = None) -> bool:
     """为单个作者写入 / 刷新 Markdown 索引（纯本地，不联网）。
@@ -967,7 +1061,9 @@ def rebuild_md_indexes(settings, db, logger, progress_cb=None) -> dict:
             logger.warning("作者 %s 索引重建失败：%s", aid, e, exc_info=True)
         if progress_cb:
             try:
-                progress_cb(report["authors"], total, aid)
+                # 返回 False 表示调用方请求中止（例如用户点了取消），立即收尾
+                if progress_cb(report["authors"], total, aid) is False:
+                    break
             except Exception:
                 pass
     return report

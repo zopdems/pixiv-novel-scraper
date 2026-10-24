@@ -67,7 +67,7 @@ class Settings:
     illust_root: str = ""
     illust_md_root: str = ""
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
-    theme: str = "light"  # light / dark / auto
+    theme: str = "dark"  # light / dark / auto（默认深色：明日方舟工业风）
 
     # ------------------------------------------------------------------
     # 高级设置：默认值全部等价于历史行为，改动才会改变抓取 / 输出方式
@@ -82,6 +82,8 @@ class Settings:
     keyword_exclude: str = ""             # 标题/简介命中则跳过，空=不限制(原行为)
     min_text_length: int = 0              # 正文最短字数，0=不限(原行为)
     catch_up_window_minutes: int = 0      # 错过定时点的补跑窗口(分钟)，0=当天任意时间都补跑(原行为)
+    batch_limit: int = 0                  # 每轮最多下载的作品数(小说+图片合计)，0=不限(原行为)
+    batch_interval_minutes: int = 30      # 分批间隔(分钟)：上一轮达到上限后，等这么久再自动续抓
 
     # --- 二、文件输出与命名 ---
     organize_by_series: bool = True       # 按「单篇 / 系列」分子目录，关=全部平铺(原行为 True)
@@ -167,7 +169,7 @@ ADVANCED_SETTING_KEYS = [
     # 一、触发与筛选
     "author_404_action", "disabled_recheck_days", "max_novels_per_author",
     "tag_whitelist", "keyword_include", "keyword_exclude", "min_text_length",
-    "catch_up_window_minutes",
+    "catch_up_window_minutes", "batch_limit", "batch_interval_minutes",
     # 二、文件输出与命名
     "organize_by_series", "illust_multipage_style", "write_md_index",
     "md_include_description", "md_include_stats", "md_single_sort",

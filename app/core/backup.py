@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -6,7 +7,37 @@ from dataclasses import asdict
 from .. import credentials
 from ..config import ProxyConfig, Settings, app_data_dir, save_settings
 
-BACKUP_VERSION = 2
+BACKUP_VERSION = 3
+
+
+def _encrypt_cookie(cookie: str) -> dict:
+    """把 Cookie 用 DPAPI 加密后放进备份；无 DPAPI 环境退回明文并标注。
+
+    备份文件可能被用户拷走 / 上传，明文 Cookie 躺在里面是实打实的泄露风险。
+    """
+    if not cookie:
+        return {"cookie": "", "cookie_encrypted": False}
+    if credentials.dpapi_available():
+        import win32crypt
+        blob = win32crypt.CryptProtectData(cookie.encode("utf-8"), "pixiv-backup",
+                                           None, None, None, 0)
+        return {"cookie": base64.b64encode(blob).decode("ascii"),
+                "cookie_encrypted": True}
+    return {"cookie": cookie, "cookie_encrypted": False}
+
+
+def _decrypt_cookie(cookie: str, encrypted: bool) -> str:
+    if not cookie:
+        return ""
+    if encrypted:
+        import win32crypt
+        try:
+            blob = base64.b64decode(cookie.encode("ascii"))
+            _, data = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+            return data.decode("utf-8")
+        except Exception:
+            return ""
+    return cookie
 
 
 def export_backup(path: str, settings: Settings, authors: list, cookie: str) -> None:
@@ -24,7 +55,7 @@ def export_backup(path: str, settings: Settings, authors: list, cookie: str) -> 
             }
             for a in authors
         ],
-        "cookie": cookie or "",
+        **_encrypt_cookie(cookie or ""),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -87,7 +118,10 @@ def import_backup(path: str, db) -> dict:
             added += 1
         db.set_author_enabled(aid, bool(a.get("enabled", 1)), kind=kind)
 
-    cookie = (payload.get("cookie") or "").strip()
+    # 兼容旧版（v2 及更早）明文 Cookie，以及新版 DPAPI 加密 Cookie
+    raw_cookie = (payload.get("cookie") or "").strip()
+    encrypted = bool(payload.get("cookie_encrypted", False))
+    cookie = _decrypt_cookie(raw_cookie, encrypted)
     if cookie:
         credentials.save_cookie(cookie)
 
