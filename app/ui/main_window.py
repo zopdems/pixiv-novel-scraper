@@ -1,4 +1,5 @@
 import os
+import shutil
 import re
 
 from PySide6.QtCore import Qt, QTime
@@ -6,7 +7,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QDoubleSpinBox, QStackedWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QTimeEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -28,7 +29,8 @@ from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
 from .icons import app_mark, icon
 from .ranking_page import RankingPageMixin
 from .theme import apply_theme, current_mode, resolve_mode, tokens
-from .worker import AuthorCheckWorker, RebuildMdWorker, ScrapeWorker
+from .worker import (AuthorCheckWorker, DryRunWorker, RebuildMdWorker,
+                     ScrapeWorker, SingleWorkWorker)
 
 _AUTHOR_ID_RE = re.compile(r"^\d+$")
 
@@ -357,6 +359,19 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.deleted_summary.setProperty("class", "hint")
         self.deleted_summary.setWordWrap(True)
         v.addWidget(self.deleted_summary)
+
+        # 操作行：清理孤儿文件（远端已删，但本地副本仍占空间）
+        op_row = QHBoxLayout()
+        op_row.setSpacing(8)
+        self.btn_clean_orphans = QPushButton("清理本地副本")
+        self.btn_clean_orphans.setProperty("class", "danger")
+        self.btn_clean_orphans.setToolTip(
+            "删除「远端已删除」作品仍留在本地的文件副本，释放磁盘空间。\n"
+            "不可恢复，删除前会二次确认并显示涉及的文件。")
+        self.btn_clean_orphans.clicked.connect(self.clean_orphan_files)
+        op_row.addWidget(self.btn_clean_orphans)
+        op_row.addStretch(1)
+        v.addLayout(op_row)
 
         self.deleted_tree = QTreeWidget()
         self.deleted_tree.setColumnCount(5)
@@ -744,6 +759,62 @@ class MainWindow(QMainWindow, RankingPageMixin):
             else:
                 webbrowser.open(f"https://www.pixiv.net/artworks/{wid}")
 
+    def clean_orphan_files(self):
+        """删除「远端已删除」作品仍留在本地的文件副本，释放磁盘空间。
+
+        二次确认，列出涉及的文件数与大小；删除后只清理本地文件，
+        数据库索引记录保持不变（远端状态依然是 deleted）。
+        """
+        try:
+            stats = self.db.orphan_local_files()
+        except Exception as e:
+            QMessageBox.warning(self, "清理失败", f"统计孤儿文件时出错：{e}")
+            return
+
+        novel = stats["novel"]
+        illust = stats["illust"]
+        total_count = novel["count"] + illust["count"]
+        if total_count == 0:
+            QMessageBox.information(self, "清理本地副本", "没有可清理的本地副本——所有已删除作品的本地文件都已不存在。")
+            return
+
+        def _fmt(n):
+            mb = n / (1024 * 1024)
+            return f"{mb:.1f} MB" if mb >= 1 else f"{n / 1024:.0f} KB"
+
+        answer = QMessageBox.warning(
+            self, "清理本地副本",
+            f"将删除 {total_count} 个「远端已删除」作品的本地副本，"
+            f"释放约 {_fmt(novel['bytes'] + illust['bytes'])}：\n\n"
+            f"小说 {novel['count']} 个（{_fmt(novel['bytes'])}）\n"
+            f"插画/漫画 {illust['count']} 个（{_fmt(illust['bytes'])}）\n\n"
+            f"此操作不可恢复，仅删除本地文件，不影响索引记录。确定继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+
+        removed = 0
+        errors = []
+        for rec in self.db.deleted_novels() + self.db.deleted_illusts():
+            path = rec.get("local_path") or ""
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed += 1
+            except OSError as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+
+        self.refresh_authors()
+        if errors:
+            QMessageBox.warning(self, "清理完成（部分失败）",
+                                f"已删除 {removed} 个，失败 {len(errors)} 个：\n" + "\n".join(errors[:8]))
+        else:
+            QMessageBox.information(self, "清理完成", f"已删除 {removed} 个本地副本。")
+
     def refresh_authors(self):
         # 重建表格会打乱当前行（排序后可能指向别的作者），先记住原来选中的是谁
         keep = {}
@@ -803,6 +874,11 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_fetch)
 
+        self.btn_dryrun = QPushButton("试运行")
+        self.btn_dryrun.setToolTip("走完整抓取流程，但只统计「会下载 / 跳过」，"
+                                   "不实际下载、不写库。用于验证筛选规则。")
+        self.btn_dryrun.clicked.connect(self.start_dry_run)
+
         self.run_status = QLabel("就绪")
         self.run_status.setProperty("class", "badge-idle")
 
@@ -818,6 +894,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
         row.addWidget(self.btn_run)
         row.addWidget(self.btn_stop)
+        row.addWidget(self.btn_dryrun)
         row.addSpacing(4)
         row.addWidget(self.run_status)
         row.addWidget(self.busy)
@@ -904,6 +981,38 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_report.connect(self.on_finished)
         self.worker.start()
+
+    def start_dry_run(self):
+        """试运行：走完整抓取流程，只统计不下载。"""
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "提示", "已有抓取任务进行中。")
+            return
+        if not credentials.load_cookie():
+            QMessageBox.warning(self, "无法试运行", "未配置 Cookie，请先在设置里导入。")
+            return
+        self.btn_dryrun.setEnabled(False)
+        self.progress_view.appendPlainText("=== 试运行开始（不下载、不写库） ===")
+        self.dry_worker = DryRunWorker(self.settings, self.db, self.logger, self)
+        self.dry_worker.finished_report.connect(self._on_dry_run_done)
+        self.dry_worker.start()
+
+    def _on_dry_run_done(self, report: dict):
+        self.btn_dryrun.setEnabled(True)
+        r = report or {}
+        if not r.get("ok"):
+            self.progress_view.appendPlainText(f"※ 试运行失败：{r.get('error')}")
+            QMessageBox.warning(self, "试运行", f"失败：{r.get('error')}")
+            return
+        if r.get("auth_expired"):
+            QMessageBox.warning(self, "试运行", "Cookie 已失效，请重新导入。")
+            return
+        self.progress_view.appendPlainText("=== 试运行结束 ===")
+        QMessageBox.information(
+            self, "试运行结果",
+            f"将下载 {r.get('would_download', 0)} 部，\n"
+            f"新增 {r.get('new', 0)} / 更新 {r.get('updated', 0)} / "
+            f"跳过 {r.get('skipped', 0)} / 失败 {r.get('failed', 0)}。\n\n"
+            "以上为预估，未做任何实际下载或写库。")
 
     def stop_fetch(self):
         if not (self.worker and self.worker.isRunning()):
@@ -1069,6 +1178,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
             self.db.set_illust_status(work_id, Status.PENDING)
         else:
             self.db.set_novel_status(work_id, Status.PENDING)
+            # 手动重试即清零重试计数，让作品重新获得自动重试机会
+            self.db.reset_novel_retry(work_id)
         self.logger.info("已将 %s 重置为待下载，下一轮抓取会重新尝试", work_id)
         self.refresh_failed()
 
@@ -1120,6 +1231,11 @@ class MainWindow(QMainWindow, RankingPageMixin):
             self.search_status.addItem(label, value)
         self.search_status.currentIndexChanged.connect(self.do_search)
         row.addWidget(self.search_status)
+
+        self.search_collection = QComboBox()
+        self.search_collection.addItem("全部收藏夹", 0)
+        self.search_collection.currentIndexChanged.connect(self.do_search)
+        row.addWidget(self.search_collection)
         bl.addLayout(row)
         outer.addWidget(bar)
 
@@ -1132,19 +1248,30 @@ class MainWindow(QMainWindow, RankingPageMixin):
         rhead.addWidget(rt)
         rhead.addWidget(self.search_count)
         rhead.addStretch(1)
+        btn_export = QPushButton("导出书库")
+        btn_export.setProperty("class", "ghost")
+        btn_export.setToolTip("把全部作品元数据导出为 CSV（Excel 可直接打开）")
+        btn_export.clicked.connect(self.export_library)
+        btn_stats = QPushButton("库统计")
+        btn_stats.setProperty("class", "ghost")
+        btn_stats.setToolTip("查看书库总览：作品数、已读、占用空间、状态分布")
+        btn_stats.clicked.connect(self.show_library_stats)
         btn_refresh = QPushButton("刷新")
         btn_refresh.setProperty("class", "ghost")
         btn_refresh.clicked.connect(self.do_search)
+        rhead.addWidget(btn_export)
+        rhead.addWidget(btn_stats)
         rhead.addWidget(btn_refresh)
         rc.addLayout(rhead)
 
-        self.search_table = QTableWidget(0, 5)
-        self.search_table.setHorizontalHeaderLabels(["标题", "类型", "作者", "状态", "本地路径"])
+        self.search_table = QTableWidget(0, 6)
+        self.search_table.setHorizontalHeaderLabels(["标题", "类型", "作者", "状态", "本地路径", "已读"])
         self.search_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.search_table.setColumnWidth(1, 110)
         self.search_table.setColumnWidth(2, 150)
         self.search_table.setColumnWidth(3, 90)
         self.search_table.setColumnWidth(4, 280)
+        self.search_table.setColumnWidth(5, 70)
         self.search_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.search_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.search_table.setAlternatingRowColors(True)
@@ -1152,12 +1279,15 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.search_table.verticalHeader().setDefaultSectionSize(36)
         self.search_table.setShowGrid(False)
         self.search_table.doubleClicked.connect(self.open_novel_dir)
+        self.search_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.search_table.customContextMenuRequested.connect(self._on_search_context_menu)
         rc.addWidget(self.search_table, 1)
         outer.addWidget(res_card, 1)
 
-        hint = QLabel("双击任意一行可打开该作品所在的目录")
+        hint = QLabel("双击任意一行可打开该作品所在的目录；右键可标记已读 / 未读、加入收藏夹")
         hint.setProperty("class", "hint")
         outer.addWidget(hint)
+        self._refresh_collection_combo()
         return page
 
     def do_search(self):
@@ -1166,12 +1296,18 @@ class MainWindow(QMainWindow, RankingPageMixin):
             return
         kind_filter = (self.search_type.currentData() or "") if self.search_type else ""
         status_filter = (self.search_status.currentData() or "") if self.search_status else ""
+        col_filter = (self.search_collection.currentData() or 0) if hasattr(self, "search_collection") else 0
 
-        rows = []
-        if kind_filter in ("", "novel"):
-            rows += [("novel", n) for n in self.db.search_novels(kw)]
-        if kind_filter in ("", "illust"):
-            rows += [("illust", i) for i in self.db.search_illusts(kw)]
+        # 选了收藏夹：只看该收藏夹里的作品（按收藏夹过滤，而非关键词检索）
+        if col_filter:
+            items = self.db.collection_items(int(col_filter))
+            rows = [(r["kind"], r) for r in items]
+        else:
+            rows = []
+            if kind_filter in ("", "novel"):
+                rows += [("novel", n) for n in self.db.search_novels(kw)]
+            if kind_filter in ("", "illust"):
+                rows += [("illust", i) for i in self.db.search_illusts(kw)]
         if status_filter:
             rows = [r for r in rows if r[1].get("status") == status_filter]
 
@@ -1183,12 +1319,179 @@ class MainWindow(QMainWindow, RankingPageMixin):
                 rec.get("author_name") or "-",
                 status_label(rec["status"]),
                 rec.get("local_path") or "-",
+                "已读" if rec.get("read_at") else "未读",
             ]):
-                self.search_table.setItem(i, c, QTableWidgetItem(str(text)))
+                item = QTableWidgetItem(str(text))
+                if c == 5:
+                    # 已读列：绿色「已读」/ 灰「未读」，并记录 kind+id+author_id 供右键使用
+                    if rec.get("read_at"):
+                        item.setForeground(QColor(tokens(current_mode())["success"]))
+                    item.setData(Qt.UserRole, (
+                        ktype,
+                        str(rec.get("novel_id" if ktype == "novel" else "illust_id")),
+                        str(rec.get("author_id") or ""),
+                    ))
+                self.search_table.setItem(i, c, item)
         if rows:
             self.search_count.setText(f"共 {len(rows)} 条")
         else:
             self.search_count.setText("没有匹配的作品（试试换关键词，或先抓取再检索）")
+
+    def _on_search_context_menu(self, pos):
+        """检索结果右键菜单：标记已读 / 未读、重新打包 / 检查更新。"""
+        item = self.search_table.itemAt(pos)
+        if item is None:
+            return
+        row = item.row()
+        read_item = self.search_table.item(row, 5)
+        if read_item is None:
+            return
+        data = read_item.data(Qt.UserRole)
+        if not data:
+            return
+        kind, work_id, author_id = data
+        menu = QMenu(self)
+        act_read = menu.addAction("标记为已读")
+        act_unread = menu.addAction("标记为未读")
+        menu.addSeparator()
+        act_rebuild = menu.addAction("重新打包")
+        menu.addSeparator()
+        # 收藏夹子菜单：加入某个已有收藏夹，或新建
+        col_menu = menu.addMenu("加入收藏夹…")
+        cols = self.db.list_collections()
+        for c in cols:
+            col_menu.addAction(c["name"], lambda _=False, cid=c["id"]: self._add_to_collection(cid, kind, work_id))
+        col_menu.addSeparator()
+        col_menu.addAction("新建收藏夹…", lambda: self._new_collection(kind, work_id))
+        chosen = menu.exec(self.search_table.viewport().mapToGlobal(pos))
+        if chosen is act_read:
+            if kind == "novel":
+                self.db.mark_novel_read(work_id, True)
+            else:
+                self.db.mark_illust_read(work_id, True)
+            self.do_search()
+        elif chosen is act_unread:
+            if kind == "novel":
+                self.db.mark_novel_read(work_id, False)
+            else:
+                self.db.mark_illust_read(work_id, False)
+            self.do_search()
+        elif chosen is act_rebuild:
+            self._rebuild_single_work(kind, work_id, author_id)
+
+    def _add_to_collection(self, cid: int, kind: str, work_id: str):
+        self.db.add_to_collection(cid, kind, work_id)
+        self.logger.info("已将 %s 加入收藏夹", work_id)
+
+    def _new_collection(self, kind: str, work_id: str):
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "新建收藏夹", "收藏夹名称：")
+        if not ok or not name.strip():
+            return
+        cid = self.db.create_collection(name)
+        if cid:
+            self.db.add_to_collection(cid, kind, work_id)
+            self.logger.info("已新建收藏夹「%s」并加入 %s", name.strip(), work_id)
+            self._refresh_collection_combo()
+
+    def export_library(self):
+        """导出全部作品元数据为 CSV。"""
+        import time as _time
+        default = f"书库清单_{_time.strftime('%Y%m%d')}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出书库", default, "CSV 文件（Excel 可直接打开） (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            n = self.db.export_library_csv(path)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            return
+        QMessageBox.information(self, "导出完成", f"已导出 {n} 条记录：\n{path}")
+
+    def show_library_stats(self):
+        """弹窗显示书库总览统计。"""
+        try:
+            s = self.db.library_stats()
+        except Exception as e:
+            QMessageBox.warning(self, "统计失败", str(e))
+            return
+
+        def _fmt(n):
+            mb = n / (1024 * 1024)
+            if mb >= 1024:
+                return f"{mb / 1024:.1f} GB"
+            return f"{mb:.1f} MB" if mb >= 1 else f"{n / 1024:.0f} KB"
+
+        def _status_line(dist):
+            if not dist:
+                return "（无）"
+            parts = []
+            for k in sorted(dist):
+                parts.append(f"{status_label(k)} {dist[k]}")
+            return "、".join(parts)
+
+        lines = [
+            f"小说：{s['novels']} 部（已读 {s['novels_read']}）",
+            f"插画/漫画：{s['illusts']} 幅（已读 {s['illusts_read']}）",
+            "",
+            f"本地占用：约 {_fmt(s['bytes'])}",
+            "",
+            "小说状态分布：",
+            "  " + _status_line(s["novel_status"]),
+            "插画状态分布：",
+            "  " + _status_line(s["illust_status"]),
+        ]
+        QMessageBox.information(self, "库统计", "\n".join(lines))
+
+    def _refresh_collection_combo(self):
+        """刷新检索页的收藏夹下拉（保留当前选中）。"""
+        if not hasattr(self, "search_collection"):
+            return
+        cur = self.search_collection.currentData() or 0
+        self.search_collection.blockSignals(True)
+        self.search_collection.clear()
+        self.search_collection.addItem("全部收藏夹", 0)
+        for c in self.db.list_collections():
+            self.search_collection.addItem(f"{c['name']}（{c['cnt']}）", int(c["id"]))
+        idx = self.search_collection.findData(cur)
+        self.search_collection.setCurrentIndex(idx if idx >= 0 else 0)
+        self.search_collection.blockSignals(False)
+
+    def _rebuild_single_work(self, kind: str, work_id: str, author_id: str):
+        """后台重新打包单个作品（复用单篇管线，强制走更新判定）。"""
+        if not credentials.load_cookie():
+            QMessageBox.warning(self, "无法重打包", "未配置 Cookie，请先在设置里导入。")
+            return
+        if not author_id:
+            QMessageBox.warning(self, "无法重打包", "该记录缺少作者 ID，无法重新打包。")
+            return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "提示", "已有抓取任务进行中，请稍候。")
+            return
+        self.progress_view.appendPlainText(f"=== 重新打包 {work_id} ===")
+        self._single_worker = SingleWorkWorker(
+            self.settings, self.db, self.logger, kind, work_id, author_id)
+        self._single_worker.finished_report.connect(self._on_single_work_done)
+        self._single_worker.start()
+
+    def _on_single_work_done(self, report: dict):
+        r = report or {}
+        if r.get("error"):
+            self.progress_view.appendPlainText(f"※ 重打包失败：{r['error']}")
+            QMessageBox.warning(self, "重打包", f"失败：{r['error']}")
+            return
+        if r.get("ok"):
+            self.progress_view.appendPlainText(
+                f"  完成：新增 {r.get('new', 0)} / 更新 {r.get('updated', 0)}")
+            QMessageBox.information(self, "重打包", "重新打包完成。")
+        else:
+            self.progress_view.appendPlainText(
+                f"※ 失败 {r.get('failed', 0)} / 更新 {r.get('updated', 0)}")
+            QMessageBox.warning(self, "重打包", "处理完成，但有失败项，详见日志。")
+        self.refresh_failed()
 
     def open_novel_dir(self):
         row = self.search_table.currentRow()
@@ -1355,6 +1658,14 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.set_disk.setSuffix(" MB")
         self.set_disk.setSingleStep(100)
         form.addRow("磁盘暂停阈值", self.set_disk)
+
+        self.set_after_fetch = combo([
+            ("无动作", "none"),
+            ("完成后休眠", "sleep"),
+            ("完成后关机", "shutdown"),
+        ], getattr(s, "after_fetch_action", "none"))
+        form.addRow("抓取完成后", self.set_after_fetch)
+        hint(form, "定时任务跑完后自动休眠 / 关机。仅在「定时抓取」触发且本轮是最后一轮（未达分批上限）时执行，手动抓取不触发。")
 
         self.set_r18 = QCheckBox("抓取 R-18 作品")
         self.set_r18.setChecked(s.r18_enabled)
@@ -1842,6 +2153,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         s.max_novels_per_author = int(self.set_cap.value())
         s.batch_limit = int(self.set_batch_limit.value())
         s.batch_interval_minutes = int(self.set_batch_interval.value())
+        s.after_fetch_action = self.set_after_fetch.currentData() or "none"
         s.tag_whitelist = [t.strip() for t in self.set_whitelist.text().split(",") if t.strip()]
         s.keyword_include = self.set_kw_in.text().strip()
         s.keyword_exclude = self.set_kw_ex.text().strip()
@@ -1905,6 +2217,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.set_cap.setValue(int(getattr(s, "max_novels_per_author", 0) or 0))
         self.set_batch_limit.setValue(int(getattr(s, "batch_limit", 0) or 0))
         self.set_batch_interval.setValue(int(getattr(s, "batch_interval_minutes", 30) or 30))
+        _set_combo(self.set_after_fetch, getattr(s, "after_fetch_action", "none"))
         self.set_whitelist.setText(",".join(getattr(s, "tag_whitelist", []) or []))
         self.set_kw_in.setText(getattr(s, "keyword_include", "") or "")
         self.set_kw_ex.setText(getattr(s, "keyword_exclude", "") or "")

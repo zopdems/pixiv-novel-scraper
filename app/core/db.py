@@ -8,9 +8,12 @@ from datetime import datetime, timedelta
 from ..config import app_data_dir
 from . import utils
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 
 SERIES_RECHECK_DAYS = 30
+
+# 失败重试次数上限：超过后不再自动重试，避免永久性失败的作品每轮都浪费一次请求
+MAX_AUTO_RETRIES = 5
 
 # 作者停用原因
 DISABLE_REASON_DEACTIVATED = "deactivated"  # 账号已注销 / 不存在（抓取时自动判定）
@@ -86,6 +89,36 @@ UPDATE authors SET disabled_reason='deactivated'
  WHERE enabled=0 AND disabled_at IS NOT NULL AND disabled_reason IS NULL;
 UPDATE authors SET disabled_reason='manual'
  WHERE enabled=0 AND disabled_at IS NULL AND disabled_reason IS NULL;
+"""
+
+# V7：失败重试计数。永久性失败的作品（作者彻底删除、版权限制等）此前会被
+# 无限重试，每轮都白白消耗一次请求；超过 MAX_AUTO_RETRIES 后不再自动重试，
+# 只在失败列表里列出，由用户手动处理。
+_SCHEMA_V7 = """
+ALTER TABLE novels ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE illusts ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+"""
+
+# V8：阅读进度标记。让「下载器」变成「书架」——知道哪些读过、哪些没读。
+_SCHEMA_V8 = """
+ALTER TABLE novels ADD COLUMN read_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE illusts ADD COLUMN read_at TEXT NOT NULL DEFAULT '';
+"""
+
+# V9：自定义收藏夹（书架）。用户把作品归入自己命名的分组，跨作者、跨类型。
+_SCHEMA_V9 = """
+CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_items (
+    collection_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    work_id TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (collection_id, kind, work_id)
+);
 """
 
 _SCHEMA_V3 = """
@@ -219,6 +252,12 @@ class Database:
             conn.executescript(_SCHEMA_V5)
         if version < 6:
             conn.executescript(_SCHEMA_V6)
+        if version < 7:
+            conn.executescript(_SCHEMA_V7)
+        if version < 8:
+            conn.executescript(_SCHEMA_V8)
+        if version < 9:
+            conn.executescript(_SCHEMA_V9)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
 
@@ -427,6 +466,28 @@ class Database:
             "UPDATE novels SET status=?, error_reason=?, last_fetch_at=? WHERE novel_id=?",
             (status, error_reason, self._now(), novel_id))
 
+    def novel_retry_count(self, novel_id: str) -> int:
+        row = self._query_one("SELECT retry_count FROM novels WHERE novel_id=?", (novel_id,))
+        return int(row["retry_count"] or 0) if row else 0
+
+    def bump_novel_retry(self, novel_id: str) -> int:
+        """失败重试计数 +1，返回新值。"""
+        self._execute(
+            "UPDATE novels SET retry_count=COALESCE(retry_count,0)+1 WHERE novel_id=?",
+            (novel_id,))
+        return self.novel_retry_count(novel_id)
+
+    def reset_novel_retry(self, novel_id: str) -> None:
+        """手动「重新抓取」时清零，让作品重新获得重试机会。"""
+        self._execute("UPDATE novels SET retry_count=0 WHERE novel_id=?", (novel_id,))
+
+    def exhausted_novels(self, limit: int = MAX_AUTO_RETRIES) -> list:
+        """重试次数已耗尽、不再自动重试的失败作品。"""
+        return self._query(
+            "SELECT * FROM novels WHERE status IN"
+            " ('failed_auth','failed_403','failed_network','failed_parse')"
+            " AND COALESCE(retry_count,0)>=? ORDER BY last_fetch_at", (int(limit),))
+
     def remove_novel(self, novel_id: str) -> None:
         """仅删除索引记录，绝不触碰本地已下载文件。"""
         self._execute("DELETE FROM novels WHERE novel_id=?", (novel_id,))
@@ -448,6 +509,38 @@ class Database:
     def deleted_novels(self) -> list:
         return self._query(
             "SELECT * FROM novels WHERE status='deleted' ORDER BY last_fetch_at DESC")
+
+    def orphan_local_files(self) -> dict:
+        """统计「远端已删除但仍占用本地空间」的文件。
+
+        返回 {kind: {"count": n, "bytes": size}}，kind 为 novel / illust。
+        只统计本地实际存在的文件（多页插画按目录递归计）。
+        """
+        out = {"novel": {"count": 0, "bytes": 0}, "illust": {"count": 0, "bytes": 0}}
+
+        def _add(kind, path):
+            if not path or not os.path.exists(path):
+                return
+            if os.path.isdir(path):
+                for root, _dirs, files in os.walk(path):
+                    for fn in files:
+                        try:
+                            out[kind]["bytes"] += os.path.getsize(os.path.join(root, fn))
+                        except OSError:
+                            pass
+                out[kind]["count"] += 1
+            else:
+                try:
+                    out[kind]["bytes"] += os.path.getsize(path)
+                except OSError:
+                    pass
+                out[kind]["count"] += 1
+
+        for n in self.deleted_novels():
+            _add("novel", n.get("local_path"))
+        for i in self.deleted_illusts():
+            _add("illust", i.get("local_path"))
+        return out
 
     def series_ids_by_author(self, author_id: str) -> list:
         conn = self._connection()
@@ -505,6 +598,16 @@ class Database:
             or utils.search_matches(r.get("author_name"), kw_norm)
             or utils.search_matches(r.get("tags"), kw_norm)
         ]
+
+    # ---- 阅读进度 ----
+    def mark_novel_read(self, novel_id: str, read: bool = True) -> None:
+        """标记小说已读 / 未读。read_at 存时间戳，未读则清空。"""
+        val = self._now() if read else ""
+        self._execute("UPDATE novels SET read_at=? WHERE novel_id=?", (val, novel_id))
+
+    def mark_illust_read(self, illust_id: str, read: bool = True) -> None:
+        val = self._now() if read else ""
+        self._execute("UPDATE illusts SET read_at=? WHERE illust_id=?", (val, illust_id))
 
     # ---- illusts ----
     def get_illust(self, illust_id: str):
@@ -585,3 +688,136 @@ class Database:
         with self._lock:
             rows = conn.execute("SELECT status, COUNT(*) FROM novels GROUP BY status").fetchall()
         return {r[0]: int(r[1]) for r in rows}
+
+    def library_stats(self) -> dict:
+        """书库总览统计：作品数、已读、占用空间、状态分布。"""
+        novels = self._query("SELECT status, read_at, local_path FROM novels")
+        illusts = self._query("SELECT status, read_at, local_path FROM illusts")
+        out = {
+            "novels": len(novels),
+            "illusts": len(illusts),
+            "novels_read": sum(1 for n in novels if n.get("read_at")),
+            "illusts_read": sum(1 for i in illusts if i.get("read_at")),
+            "novel_status": {},
+            "illust_status": {},
+            "bytes": 0,
+        }
+        for n in novels:
+            out["novel_status"][n["status"]] = out["novel_status"].get(n["status"], 0) + 1
+        for i in illusts:
+            out["illust_status"][i["status"]] = out["illust_status"].get(i["status"], 0) + 1
+        for rec in novels + illusts:
+            p = rec.get("local_path") or ""
+            if p and os.path.exists(p):
+                if os.path.isdir(p):
+                    for root, _d, files in os.walk(p):
+                        for fn in files:
+                            try:
+                                out["bytes"] += os.path.getsize(os.path.join(root, fn))
+                            except OSError:
+                                pass
+                else:
+                    try:
+                        out["bytes"] += os.path.getsize(p)
+                    except OSError:
+                        pass
+        return out
+
+    # ---- 收藏夹（书架）----
+    def list_collections(self) -> list:
+        """全部收藏夹，含作品数。"""
+        return self._query(
+            "SELECT c.id, c.name, c.created_at,"
+            " (SELECT COUNT(*) FROM collection_items i WHERE i.collection_id=c.id) AS cnt"
+            " FROM collections c ORDER BY c.created_at")
+
+    def create_collection(self, name: str) -> int:
+        """新建收藏夹，返回 id；重名返回已有 id（不报错）。"""
+        name = (name or "").strip()
+        if not name:
+            return 0
+        row = self._query_one("SELECT id FROM collections WHERE name=?", (name,))
+        if row:
+            return int(row["id"])
+        conn = self._connection()
+        with self._lock:
+            cur = conn.execute(
+                "INSERT INTO collections(name, created_at) VALUES(?,?)",
+                (name, self._now()))
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def add_to_collection(self, collection_id: int, kind: str, work_id: str) -> bool:
+        """把作品加入收藏夹（重复添加幂等）。"""
+        try:
+            self._execute(
+                "INSERT OR IGNORE INTO collection_items(collection_id, kind, work_id, added_at)"
+                " VALUES(?,?,?,?)", (collection_id, kind, work_id, self._now()))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_from_collection(self, collection_id: int, kind: str, work_id: str) -> None:
+        self._execute(
+            "DELETE FROM collection_items WHERE collection_id=? AND kind=? AND work_id=?",
+            (collection_id, kind, work_id))
+
+    def collection_items(self, collection_id: int) -> list:
+        """收藏夹里的全部作品（novel + illust 合并）。
+
+        返回的每条记录带 kind / novel_id 或 illust_id / author_id / read_at，
+        与 search_novels / search_illusts 的字段对齐，供检索页直接复用。
+        """
+        out = []
+        for r in self._query(
+                "SELECT 'novel' AS kind, novel_id, author_id, title, author_name,"
+                " tags, read_at, publish_date, status, local_path FROM novels"
+                " WHERE novel_id IN"
+                " (SELECT work_id FROM collection_items WHERE collection_id=? AND kind='novel')",
+                (collection_id,)):
+            out.append(dict(r))
+        for r in self._query(
+                "SELECT 'illust' AS kind, illust_id, author_id, title, author_name,"
+                " tags, read_at, publish_date, status, local_path FROM illusts"
+                " WHERE illust_id IN"
+                " (SELECT work_id FROM collection_items WHERE collection_id=? AND kind='illust')",
+                (collection_id,)):
+            out.append(dict(r))
+        return out
+
+    def delete_collection(self, collection_id: int) -> None:
+        self._execute("DELETE FROM collection_items WHERE collection_id=?", (collection_id,))
+        self._execute("DELETE FROM collections WHERE id=?", (collection_id,))
+
+    # ---- 书库导出 ----
+    def export_library_csv(self, path: str) -> int:
+        """导出全部作品元数据为 CSV（UTF-8 BOM，Excel 可直接打开）。"""
+        import csv
+        novels = self._query(
+            "SELECT novel_id, title, author_id, author_name, series_title,"
+            " tags, x_restrict, status, publish_date, remote_updated_at,"
+            " read_at, local_path FROM novels ORDER BY publish_date DESC")
+        illusts = self._query(
+            "SELECT illust_id, title, author_id, author_name, '' AS series_title,"
+            " tags, x_restrict, status, publish_date, remote_updated_at,"
+            " read_at, local_path FROM illusts ORDER BY publish_date DESC")
+        rows = 0
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["类型", "作品ID", "标题", "作者", "作者ID", "系列",
+                        "标签", "R-18", "状态", "发布时间", "更新时间", "已读", "本地路径"])
+            for r in novels:
+                w.writerow(["小说", r["novel_id"], r["title"], r["author_name"],
+                            r["author_id"], r["series_title"], r["tags"],
+                            "是" if r["x_restrict"] else "", r["status"],
+                            r["publish_date"], r["remote_updated_at"],
+                            "已读" if r["read_at"] else "未读", r["local_path"]])
+                rows += 1
+            for r in illusts:
+                w.writerow(["插画/漫画", r["illust_id"], r["title"], r["author_name"],
+                            r["author_id"], "", r["tags"],
+                            "是" if r["x_restrict"] else "", r["status"],
+                            r["publish_date"], r["remote_updated_at"],
+                            "已读" if r["read_at"] else "未读", r["local_path"]])
+                rows += 1
+        return rows

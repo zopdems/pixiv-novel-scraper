@@ -19,6 +19,8 @@ def _engine(batch_limit):
     eng.settings = s
     eng._batch_downloaded = 0
     eng._batch_limit = batch_limit
+    eng.dry_run = False
+    eng.dry_run_would_download = 0
     return eng
 
 
@@ -51,3 +53,12 @@ def test_report_has_truncated_flag():
     from app.core.scraper import RunReport
     r = RunReport()
     assert r.truncated is False
+
+
+def test_dry_run_flag_and_counter():
+    eng = _engine(0)
+    assert eng.dry_run is False
+    assert eng.dry_run_would_download == 0
+    eng.dry_run = True
+    eng.dry_run_would_download += 1
+    assert eng.dry_run_would_download == 1

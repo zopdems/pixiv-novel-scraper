@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import sys
+import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 
 APP_NAME = "PixivNovelScraper"
@@ -84,6 +86,7 @@ class Settings:
     catch_up_window_minutes: int = 0      # 错过定时点的补跑窗口(分钟)，0=当天任意时间都补跑(原行为)
     batch_limit: int = 0                  # 每轮最多下载的作品数(小说+图片合计)，0=不限(原行为)
     batch_interval_minutes: int = 30      # 分批间隔(分钟)：上一轮达到上限后，等这么久再自动续抓
+    after_fetch_action: str = "none"      # 抓取完成后：none=无 / sleep=休眠 / shutdown=关机
 
     # --- 二、文件输出与命名 ---
     organize_by_series: bool = True       # 按「单篇 / 系列」分子目录，关=全部平铺(原行为 True)
@@ -142,23 +145,66 @@ def config_path() -> str:
 
 
 def load_settings() -> Settings:
+    """读取配置；文件损坏时备份原件再回退默认值，并留下可排查的痕迹。
+
+    旧实现直接 `except: return Settings()`，config.json 只要有一个字节损坏，
+    所有设置就会无声无息回到出厂状态，用户完全不知道发生过什么。
+    """
     path = config_path()
     if not os.path.exists(path):
         return Settings()
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+    except Exception as e:
+        # 备份损坏文件，让用户还有机会手工抢救
+        try:
+            corrupt = path + ".corrupt-" + time.strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(path, corrupt)
+        except OSError:
+            corrupt = "(备份失败)"
+        try:
+            _logger().error("配置文件损坏，已备份为 %s，本次将使用默认设置：%s", corrupt, e)
+        except Exception:
+            pass
+        return Settings()
+
+    try:
         proxy_raw = raw.pop("proxy", {}) or {}
         settings = Settings(**{k: v for k, v in raw.items() if k in Settings.__dataclass_fields__ and k != "proxy"})
         settings.proxy = ProxyConfig(**{k: v for k, v in proxy_raw.items() if k in ProxyConfig.__dataclass_fields__})
         return settings
-    except Exception:
+    except Exception as e:
+        # 文件是合法 JSON 但字段对不上（比如版本回退导致字段类型变了）
+        try:
+            _logger().error("配置文件字段解析失败，使用默认设置：%s", e)
+        except Exception:
+            pass
         return Settings()
 
 
+def _logger():
+    """取应用 logger（避免在 config 模块顶层引入 logging_setup 造成循环依赖）。"""
+    import logging
+    return logging.getLogger("pixiv_scraper")
+
+
 def save_settings(settings: Settings) -> None:
-    with open(config_path(), "w", encoding="utf-8") as f:
-        json.dump(asdict(settings), f, ensure_ascii=False, indent=2)
+    """原子写入配置：先写临时文件再替换，避免写入中断留下半截 config.json。"""
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = json.dumps(asdict(settings), ensure_ascii=False, indent=2).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_cfg_", suffix=".json")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +216,7 @@ ADVANCED_SETTING_KEYS = [
     "author_404_action", "disabled_recheck_days", "max_novels_per_author",
     "tag_whitelist", "keyword_include", "keyword_exclude", "min_text_length",
     "catch_up_window_minutes", "batch_limit", "batch_interval_minutes",
+    "after_fetch_action",
     # 二、文件输出与命名
     "organize_by_series", "illust_multipage_style", "write_md_index",
     "md_include_description", "md_include_stats", "md_single_sort",

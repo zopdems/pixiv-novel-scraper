@@ -50,6 +50,9 @@ class ScraperEngine:
         # 分批抓取：本轮已成功下载的作品数（小说 + 图片合计）
         self._batch_downloaded = 0
         self._batch_limit = self._cfg_int("batch_limit", 0)
+        # 试运行（dry-run）：只走筛选与更新判定，不下载、不写库
+        self.dry_run = False
+        self.dry_run_would_download = 0
         # 各子系统的可选项（缺省即历史行为）
         self.popts = paths.output_opts(settings)
         self.eopts = epub_exporter.epub_opts(settings)
@@ -266,7 +269,20 @@ class ScraperEngine:
         return True
 
     def _retry_failed_queue(self):
-        queue = [n for n in self.db.failed_novels() if n["status"] != Status.FAILED_AUTH]
+        # 重试次数耗尽的作品不再自动重试：永久性失败（作者彻底删除、版权限制等）
+        # 每轮都重试一次只是白白消耗请求配额，留给用户在界面手动处理。
+        max_retry = getattr(self.db, "MAX_AUTO_RETRIES", 5)
+        skipped, queue = [], []
+        for n in self.db.failed_novels():
+            if n["status"] == Status.FAILED_AUTH:
+                continue
+            if int(n.get("retry_count") or 0) >= max_retry:
+                skipped.append(n)
+            else:
+                queue.append(n)
+        if skipped:
+            self.logger.info("失败队列中 %d 部已重试 %d 次仍失败，本轮跳过（可在失败列表手动重试）",
+                             len(skipped), max_retry)
         if not queue:
             return
         self.logger.info("优先重试失败队列：%d 部", len(queue))
@@ -274,7 +290,19 @@ class ScraperEngine:
         stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0}
         for novel in queue:
             self._guard_failures()
-            self._process_novel(novel["novel_id"], novel["author_id"], is_retry=True, stat=stat)
+            try:
+                self._process_novel(novel["novel_id"], novel["author_id"],
+                                    is_retry=True, stat=stat)
+            except (_AbortRun, _BatchLimitReached):
+                raise  # 中止/达到上限必须往外传，交由 run() 统一收尾
+            except Exception:
+                # 单部作品的未预期异常不能中断整个重试队列，
+                # 否则后面的作品连重试的机会都没有。
+                self.logger.warning("重试 %s 时发生未预期错误", novel["novel_id"],
+                                    exc_info=True)
+                stat["failed"] += 1
+                self.db.set_novel_status(novel["novel_id"], Status.FAILED_PARSE,
+                                         "重试时发生未预期错误")
         self.report.new_count += stat["new"]
         self.report.updated_count += stat["updated"]
         self.report.skipped_count += stat["skipped"]
@@ -401,7 +429,7 @@ class ScraperEngine:
         self.db.touch_author_fetch(aid, kind="novel")
         self._refresh_author_md(aid, stat)
         self._merge_stat(stat, aid)
-        self._emit("author_done", author_id=aid, **{k: v for k, v in stat.items() if not k.startswith("_")})
+        self._emit_author_done(aid, stat)
 
     def _migrate_filenames(self, author_id: str = None):
         """按当前命名规则重命名 EPUB。
@@ -489,7 +517,7 @@ class ScraperEngine:
         self.db.touch_author_fetch(aid, kind="illust")
         self._refresh_author_md(aid, stat)
         self._report_illust_stat(stat)
-        self._emit("author_done", author_id=aid, **{k: v for k, v in stat.items() if not k.startswith("_")})
+        self._emit_author_done(aid, stat)
 
     def _merge_stat(self, stat: dict, author_id: str = "") -> None:
         """把单作者统计并入总报告（幂等，重复调用不会重复累计）。
@@ -527,8 +555,19 @@ class ScraperEngine:
         if not author_id:
             author_id = stat.get("author_id", "")
         self._merge_stat(stat, author_id)
+        self._emit_author_done(author_id, stat)
+
+    def _emit_author_done(self, author_id: str, stat: dict) -> None:
+        """发 author_done 事件。
+
+        统一走这里是为了避免一个反复踩的坑：stat 里可能也带 author_id 键，
+        写成 _emit("author_done", author_id=aid, **stat) 会因关键字重复抛
+        TypeError，而调用处的 except 会把它吞掉 —— 事件就静默地发不出来了。
+        """
+        payload = {k: v for k, v in stat.items() if not k.startswith("_")}
+        payload["author_id"] = author_id
         try:
-            self._emit("author_done", author_id=author_id, **{k: v for k, v in stat.items() if not k.startswith("_")})
+            self._emit("author_done", **payload)
         except Exception:
             pass
 
@@ -663,6 +702,12 @@ class ScraperEngine:
                     return
 
         is_update = existing is not None
+        if self.dry_run:
+            self.dry_run_would_download += 1
+            stat["illust_updated" if is_update else "illust_new"] += 1
+            self.logger.info("[试运行] 图片 %s《%s》本应%s", illust_id, meta.title,
+                             "更新" if is_update else "下载")
+            return
         try:
             urls = api.get_illust_page_urls(self.client, illust_id)
             if len(urls) < meta.page_count:
@@ -828,6 +873,13 @@ class ScraperEngine:
                     return meta.author_name
 
         is_update = existing is not None
+        if self.dry_run:
+            # 试运行：已通过所有筛选，本应下载。只计数，不做任何网络写入。
+            self.dry_run_would_download += 1
+            stat["updated" if is_update else "new"] += 1
+            self.logger.info("[试运行] %s《%s》本应%s", novel_id, meta.title,
+                             "更新" if is_update else "新下载")
+            return meta.author_name
         try:
             title_style = str(self._cfg("chapter_title_style", "marker"))
             converted = convert_novel_markup(content, title_style=title_style)
@@ -953,6 +1005,11 @@ class ScraperEngine:
                 "novel_id": novel_id, "author_id": author_id,
                 "status": status, "error_reason": str(err)[:500],
             })
+        # 失败就累加重试计数，供「重试次数耗尽则跳过自动重试」使用
+        try:
+            self.db.bump_novel_retry(novel_id)
+        except Exception:
+            pass
 
     def _refresh_author_md(self, author_id: str, run_stat: dict = None):
         # 抓取流程遵守「生成作者索引 MD」开关；「一键重建索引」会直接调用

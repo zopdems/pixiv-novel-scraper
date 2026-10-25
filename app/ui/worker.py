@@ -90,6 +90,79 @@ class RankingWorker(QThread):
         self.finished_report.emit(report)
 
 
+class SingleWorkWorker(QThread):
+    """重新打包 / 检查更新单个作品（复用单篇管线，不联网拉作者列表）。"""
+
+    finished_report = Signal(object)
+
+    def __init__(self, settings, db, logger, kind: str, work_id: str, author_id: str,
+                 parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.db = db
+        self.logger = logger
+        self.kind = kind          # 'novel' / 'illust'
+        self.work_id = work_id
+        self.author_id = author_id
+        self.engine = None
+
+    def run(self):
+        try:
+            engine = ScraperEngine(self.settings, self.db, load_cookie(),
+                                   self.logger)
+            self.engine = engine
+            stat = {"new": 0, "updated": 0, "skipped": 0, "failed": 0}
+            if self.kind == "novel":
+                # 强制走更新判定（忽略时间戳），实现「重新打包」语义
+                name = engine._process_novel(self.work_id, self.author_id, stat=stat)
+            else:
+                stat = {"illust_new": 0, "illust_updated": 0,
+                        "illust_skipped": 0, "illust_failed": 0}
+                engine._process_illust(self.work_id, self.author_id, stat)
+                name = ""
+            engine.client.close()
+            self.finished_report.emit({
+                "ok": stat.get("failed", 0) == 0 and stat.get("illust_failed", 0) == 0,
+                "new": stat.get("new", 0), "updated": stat.get("updated", 0),
+                "skipped": stat.get("skipped", 0), "failed": stat.get("failed", 0),
+            })
+        except Exception as e:
+            self.logger.error("单个作品处理异常：%s", e, exc_info=True)
+            if self.engine:
+                self.engine.client.close()
+            self.finished_report.emit({"ok": False, "error": str(e)})
+
+
+class DryRunWorker(QThread):
+    """试运行：走完整抓取流程但只记录「会下载/跳过」，不下载、不写库。"""
+
+    finished_report = Signal(object)
+
+    def __init__(self, settings, db, logger, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.db = db
+        self.logger = logger
+
+    def run(self):
+        try:
+            engine = ScraperEngine(self.settings, self.db, load_cookie(),
+                                   self.logger)
+            engine.dry_run = True
+            report = engine.run()
+            engine.client.close()
+            self.finished_report.emit({
+                "ok": True,
+                "would_download": engine.dry_run_would_download,
+                "new": report.new_count, "updated": report.updated_count,
+                "skipped": report.skipped_count, "failed": report.failed_count,
+                "auth_expired": report.auth_expired,
+            })
+        except Exception as e:
+            self.logger.error("试运行异常：%s", e, exc_info=True)
+            self.finished_report.emit({"ok": False, "error": str(e)})
+
+
 class RebuildMdWorker(QThread):
     """离线重建全部作者的 Markdown 索引（不联网）。"""
 

@@ -73,8 +73,13 @@ def main():
     # 分批抓取的续抓状态：记录「上一轮因达到上限而截断」的完成时间，
     # 供定时 tick 判断间隔是否已到，从而自动接着抓下一批。
     batch_state = {"truncated_at": None}
+    # 本次抓取是否由「定时任务」触发（区别于手动点按钮）。用于完成后动作
+    # （休眠/关机）只在定时触发且跑完最后一轮时执行。
+    run_flags = {"scheduled": False}
 
     def notify_report(report):
+        was_scheduled = run_flags["scheduled"]
+        run_flags["scheduled"] = False
         if getattr(report, "auth_expired", False):
             tray.notify("Cookie 已失效", "请重新导入登录 Cookie，否则定时抓取会持续失败")
         elif getattr(report, "aborted_reason", "") and not getattr(report, "truncated", False):
@@ -93,8 +98,23 @@ def main():
                 "抓取完成",
                 f"新增 {report.new_count} 部，更新 {report.updated_count} 部，失败 {report.failed_count} 部",
             )
+            # 完成后动作：仅定时触发 + 跑完（非分批截断）时执行
+            if was_scheduled:
+                _apply_after_fetch_action()
 
     window.on_fetch_done = notify_report
+
+    def _apply_after_fetch_action():
+        """按设置执行抓取完成后的休眠 / 关机。"""
+        action = str(getattr(settings, "after_fetch_action", "none") or "none")
+        if action == "sleep":
+            import subprocess
+            subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
+            tray.notify("正在休眠", "抓取已完成，即将休眠系统")
+        elif action == "shutdown":
+            import subprocess
+            subprocess.Popen(["shutdown", "/s", "/t", "60"])
+            tray.notify("即将关机", "抓取已完成，系统将在 60 秒后关机（可用 shutdown /a 取消）")
 
     def notify_ranking(report):
         """排行榜任务的完成通知（定时抓取时通常人在别的页面，靠这个看到结果）。"""
@@ -155,6 +175,7 @@ def main():
                 else:
                     logger.info("分批续抓触发（距上一轮 %.0f 分钟）", elapsed_min)
                     batch_state["truncated_at"] = None  # 先清，避免本轮抓取期间重复触发
+                    run_flags["scheduled"] = True
                     window.start_fetch()
             return  # 有续抓在排，本 tick 不再处理每日定时
 
@@ -178,6 +199,7 @@ def main():
         if not scheduler.should_run():
             return
         logger.info("定时任务触发（%s）", settings.fetch_time)
+        run_flags["scheduled"] = True
         window.start_fetch()
 
     timer = QTimer()
