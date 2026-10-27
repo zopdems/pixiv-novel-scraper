@@ -195,6 +195,10 @@ def main():
         if window.worker and window.worker.isRunning():
             logger.info("定时任务跳过：已有任务进行中，稍后空闲再触发")
             return
+        # 排行榜任务也在跑时同样跳过：两个任务并发会互相抢请求、触发风控
+        if window.rank_worker and window.rank_worker.isRunning():
+            logger.info("定时任务跳过：排行榜任务进行中，稍后空闲再触发")
+            return
         # 确认能真的开工，再消耗今天的触发机会
         if not scheduler.should_run():
             return

@@ -859,13 +859,16 @@ class RankingPageMixin:
             return
         if use_all_modes:
             modes = self._rank_modes_for_fetch()
+            # 定时任务固定抓「今天」，绝不能被日历控件当前停留的历史日期带偏
+            date = None
         else:
             sel = self.rank_mode_combo.currentData()
             modes = [sel] if sel in ALL_MODES else self._rank_modes_for_fetch()
-        # 选了过去的日期 = 补抓历史；今天则交给接口自己决定（每日榜是前一天的成绩）
-        picked = self._current_rank_date()
-        date = None if picked == QDate.currentDate().toString("yyyy-MM-dd") \
-            else picked.replace("-", "")
+            # 手动抓取：选了过去的日期 = 补抓历史；今天则交给接口自己决定
+            # （每日榜是前一天的成绩）
+            picked = self._current_rank_date()
+            date = None if picked == QDate.currentDate().toString("yyyy-MM-dd") \
+                else picked.replace("-", "")
         self.btn_rank_fetch.setEnabled(False)
         self.btn_rank_stop.setEnabled(True)
         self.rank_busy.setVisible(True)
