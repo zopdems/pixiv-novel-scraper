@@ -93,8 +93,22 @@ def fetch_ranking(client: PixivClient, mode: str, logger=None,
 
     mode 无效时接口会返回空 body（rookie）或 400（original），此处按空结果处理并告警。
     """
+    items, rank_date, _masked = _fetch_ranking_detailed(client, mode, logger, date, top_n)
+    return items, rank_date
+
+
+def _fetch_ranking_detailed(client: PixivClient, mode: str, logger=None,
+                            date: str = None, top_n: int = TOP_N):
+    """抓取榜单，返回 (归一化列表, 榜单日期, 是否被遮蔽)。
+
+    第三个返回值 masked：接口返回了条目、但全部是字符串占位（未登录时
+    男性向/女性向/R-18 榜会被遮蔽）时为 True；榜单本身为空（当天未公布 /
+    该日期无数据）时为 False。两者都表现为空列表，但原因完全不同——
+    遮蔽需要 Cookie，空榜单则是正常现象，不能混为一谈。
+    """
     items = []
     rank_date = ""
+    masked = False
     requested_date = _norm_date(date) if date else ""
     pages = max(1, (top_n + PAGE_SIZE - 1) // PAGE_SIZE)
     for page in range(1, pages + 1):
@@ -109,15 +123,19 @@ def fetch_ranking(client: PixivClient, mode: str, logger=None,
         arr = ((body.get("display_a") or {}).get("rank_a")) or []
         if not arr:
             break
-        # 未登录时部分条目会被遮蔽成字符串占位（时有时无），跳过，避免解析崩溃
-        items.extend([x for x in arr if isinstance(x, dict)])
+        dict_items = [x for x in arr if isinstance(x, dict)]
+        # 有非字典条目（字符串占位）= 未登录遮蔽
+        if len(dict_items) < len(arr):
+            masked = True
+        items.extend(dict_items)
         if len(arr) < PAGE_SIZE:
             break
     if not items and logger:
         logger.warning("榜单 %s 未取到数据（可能不支持该榜单或当日无数据）", mode)
     # 回退顺序：接口给的日期 → 你请求的日期 → 今天
-    return [normalize(x) for x in items][:top_n], \
-        rank_date or requested_date or time.strftime("%Y-%m-%d")
+    return ([normalize(x) for x in items][:top_n],
+            rank_date or requested_date or time.strftime("%Y-%m-%d"),
+            masked)
 
 
 class RankingService:
@@ -273,7 +291,7 @@ class RankingService:
                 break
             self.progress_cb({"tag": "rank_start", "mode": mode})
             try:
-                items, rank_date = fetch_ranking(
+                items, rank_date, masked = _fetch_ranking_detailed(
                     self.client, mode, self.logger, date=date, top_n=top_n)
             except AuthExpiredError:
                 report["auth_expired"] = True
@@ -286,15 +304,20 @@ class RankingService:
                 report["errors"].append(f"{mode}：{e}")
                 continue
             if not items:
-                # 无登录 Cookie 时，男性向 / 女性向榜的条目会被遮蔽成 '0','1','2'… 占位；
-                # 而当天/未来的榜单则是还没公布，两种情况要分开说清楚
-                if date and _norm_date(date) >= time.strftime("%Y-%m-%d"):
+                # 区分「被遮蔽」与「榜单本身为空」：
+                # - masked=True：接口返回了条目但全是字符串占位 → 未登录被遮蔽
+                # - masked=False：榜单当天未公布 / 该日期无数据，与 Cookie 无关
+                if masked:
+                    report["errors"].append(
+                        f"{mode_label_of(mode)}榜条目被遮蔽，"
+                        f"可能需要登录 Cookie（R-18 榜无 Cookie 会直接 403）")
+                elif date and _norm_date(date) >= time.strftime("%Y-%m-%d"):
                     report["errors"].append(f"{mode_label_of(mode)}榜当天榜单尚未公布")
                 else:
                     report["errors"].append(
-                        f"{mode_label_of(mode)}榜未取到数据（条目被遮蔽，"
-                        f"可能需要登录 Cookie；R-18 榜无 Cookie 会直接 403）")
-                self.logger.warning("榜单 %s 未取到可用条目", mode)
+                        f"{mode_label_of(mode)}榜当日无数据（榜单未更新或该日期无榜单，"
+                        f"与 Cookie 无关）")
+                self.logger.warning("榜单 %s 未取到可用条目（遮蔽=%s）", mode, masked)
                 continue
             total = len(items)
             if lang:

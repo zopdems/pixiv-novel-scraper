@@ -749,9 +749,9 @@ check("补抓：TXT 里带来源与条数",
 _db12.close()
 _rdb5.close()
 
-# 24. 空榜单要给出可区分的提示（当天未公布 / 条目被遮蔽）
+# 24. 空榜单要给出可区分的提示（当天未公布 / 榜单无数据 / 条目被遮蔽）
 class _EmptyStubClient:
-    """返回空榜单，模拟未登录遮蔽或当天未公布。"""
+    """返回空榜单，模拟当天未公布 / 该日期无榜单。"""
 
     def get_json(self, url):
         return {"body": {"date": "", "display_a": {"rank_a": []}}}
@@ -760,7 +760,17 @@ class _EmptyStubClient:
         pass
 
 
-def _run_empty(date_str):
+class _MaskedStubClient:
+    """返回全是字符串占位的榜单，模拟未登录遮蔽。"""
+
+    def get_json(self, url):
+        return {"body": {"date": "", "display_a": {"rank_a": ["0", "1", "2"]}}}
+
+    def close(self):
+        pass
+
+
+def _run_empty(date_str, client=None):
     s = Settings()
     s.ranking_language_filter = False
     s.ranking_csv_enabled = False
@@ -773,7 +783,7 @@ def _run_empty(date_str):
     svc.cookie = ""
     svc._stop = _threading.Event()
     svc.progress_cb = lambda e: None
-    svc.client = _EmptyStubClient()
+    svc.client = client or _EmptyStubClient()
     try:
         return svc._run_once(["daily"], download=False, date=date_str)
     finally:
@@ -787,8 +797,13 @@ check("空榜单：不崩溃且未收录", _r_today["collected"] == 0)
 check("空榜单：当天提示「尚未公布」",
       any("尚未公布" in e for e in _r_today["errors"]))
 _r_past = _run_empty("20260101")
-check("空榜单：历史日期提示「被遮蔽」",
-      any("被遮蔽" in e for e in _r_past["errors"]))
+check("空榜单：历史日期提示「无数据」",
+      any("无数据" in e for e in _r_past["errors"]))
+check("空榜单：历史日期不再误报「被遮蔽」",
+      not any("被遮蔽" in e for e in _r_past["errors"]))
+_r_masked = _run_empty("20260101", client=_MaskedStubClient())
+check("遮蔽榜单：提示「被遮蔽」",
+      any("被遮蔽" in e for e in _r_masked["errors"]))
 
 # 25. 抓取历史（rank_runs）：读写、累计、裁剪、导出
 _rdb6 = RankDatabase(os.path.join(tmp, "rank6.db"), logging.getLogger("t"))
