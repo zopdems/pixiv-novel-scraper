@@ -170,11 +170,16 @@ class Database:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
-        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
+        # isolation_level=None 即 autocommit：每条语句独立提交，SELECT 不会在
+        # 连接上遗留未关闭的读事务。否则读完后做写操作时，sqlite 要把读锁升级为
+        # 写锁，WAL 模式下若有别的连接提交过数据就会报 "database is locked"。
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0,
+                               isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
         except Exception:
             pass
         self._local.conn = conn
@@ -205,9 +210,28 @@ class Database:
     def _execute(self, sql: str, params=()):
         conn = self._connection()
         with self._lock:
-            cur = conn.execute(sql, tuple(params))
-            conn.commit()
-            return cur
+            return self._execute_retry(conn, sql, params)
+
+    def _execute_retry(self, conn, sql, params, attempts: int = 5):
+        """写操作遇到 "database is locked" 时退避重试。
+
+        autocommit 模式已从根上避免读锁升级冲突，但两个 writer 恰好同时写同一库
+        仍会短暂锁住；busy_timeout=30s 兜底不一定够，这里再退避重试几次。
+        """
+        import time as _time
+        last = None
+        for i in range(attempts):
+            try:
+                cur = conn.execute(sql, tuple(params))
+                if conn.isolation_level is not None:
+                    conn.commit()
+                return cur
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower():
+                    raise
+                last = e
+                _time.sleep(0.1 * (i + 1))
+        raise last
 
     def close(self):
         conn = getattr(self._local, "conn", None)
@@ -268,15 +292,17 @@ class Database:
     # ---- authors ----
     def add_author(self, author_id: str, author_name: str = "", pending_validate: bool = False, kind: str = "novel") -> bool:
         conn = self._connection()
-        try:
-            conn.execute(
-                "INSERT INTO authors(author_id, kind, author_name, pending_validate, created_at) VALUES (?,?,?,?,?)",
-                (author_id, kind, author_name, int(pending_validate), self._now()),
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
+        with self._lock:
+            try:
+                self._execute_retry(
+                    conn,
+                    "INSERT INTO authors(author_id, kind, author_name, pending_validate, created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (author_id, kind, author_name, int(pending_validate), self._now()),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
 
     def remove_author(self, author_id: str, kind: str = "novel"):
         self._execute("DELETE FROM authors WHERE author_id=? AND kind=?", (author_id, kind))
