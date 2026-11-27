@@ -450,34 +450,95 @@ class ScraperEngine:
         此时不应重新下载正文，只需改索引 + 迁移 EPUB 目录。
         """
         old_path = rec.get("local_path") or ""
+        updated = dict(rec)
+        updated["series_id"] = series_id
+        updated["series_title"] = series_title
+        new_path = old_path
+        if old_path and os.path.exists(old_path):
+            desired = paths.novel_path(self.settings.epub_root, updated,
+                                       self.settings.name_pattern, self.popts)
+            desired = paths.resolve_collision(desired, updated, old_path)
+            if os.path.abspath(desired) != os.path.abspath(old_path):
+                try:
+                    os.makedirs(os.path.dirname(desired), exist_ok=True)
+                    os.rename(old_path, desired)
+                    new_path = desired
+                    self.logger.info("作品 %s 补归系列 %s：%s -> %s",
+                                     rec["novel_id"], series_id,
+                                     os.path.basename(old_path), os.path.basename(desired))
+                    try:
+                        os.removedirs(os.path.dirname(old_path))
+                    except OSError:
+                        pass
+                except OSError:
+                    # 迁移失败：只改库不改文件路径，避免库与磁盘不一致；
+                    # 下次 _migrate_filenames 会按新 series_id 重试迁移。
+                    self.logger.warning("作品 %s 迁移到系列目录失败，仅更新系列信息",
+                                        rec["novel_id"], exc_info=True)
+        # 无论文件是否迁移成功，先落系列信息；若迁移失败则保留旧路径，
+        # 交给后续 _migrate_filenames 兜底。
         self.db.upsert_novel({
             "novel_id": rec["novel_id"],
             "series_id": series_id,
             "series_title": series_title,
+            "local_path": new_path,
         })
-        if not old_path or not os.path.exists(old_path):
-            return
-        updated = dict(rec)
-        updated["series_id"] = series_id
-        updated["series_title"] = series_title
-        desired = paths.novel_path(self.settings.epub_root, updated,
-                                   self.settings.name_pattern, self.popts)
-        desired = paths.resolve_collision(desired, updated, old_path)
-        if os.path.abspath(desired) == os.path.abspath(old_path):
-            return
-        try:
-            os.makedirs(os.path.dirname(desired), exist_ok=True)
-            os.rename(old_path, desired)
-            self.db.upsert_novel({"novel_id": rec["novel_id"], "local_path": desired})
-            self.logger.info("作品 %s 补归系列 %s：%s -> %s",
-                             rec["novel_id"], series_id,
-                             os.path.basename(old_path), os.path.basename(desired))
+
+    def reclassify_series(self) -> dict:
+        """一键重新归类全部小说系列（不下载正文、不查作品详情）。
+
+        遍历所有小说作者 → 从 profile/all 拉远端系列列表 → 逐个系列拉成员，
+        把本地 series_id 缺失/不一致的作品补归系列并迁移目录。
+        用于修复历史版本遗留的「单篇/系列目录错乱」。
+        返回 {"authors": n, "series": n, "fixed": n, "failed": n, "stopped": bool}
+        """
+        report = {"authors": 0, "series": 0, "fixed": 0, "failed": 0, "stopped": False}
+        authors = self.db.list_authors(enabled_only=True, kind="novel")
+        self.logger.info("重新归类系列：共 %d 位小说作者", len(authors))
+        for author in authors:
+            if self._stop_event.is_set():
+                report["stopped"] = True
+                break
+            aid = author["author_id"]
+            report["authors"] += 1
             try:
-                os.removedirs(os.path.dirname(old_path))
-            except OSError:
-                pass
-        except OSError:
-            self.logger.warning("作品 %s 迁移到系列目录失败", rec["novel_id"], exc_info=True)
+                remote_series = set(api.get_user_series_ids(self.client, aid))
+            except AuthExpiredError:
+                raise
+            except Exception as e:
+                self.logger.warning("作者 %s 系列列表获取失败：%s", aid, e)
+                report["failed"] += 1
+                continue
+            for series_id in sorted(remote_series, key=int):
+                if self._stop_event.is_set():
+                    report["stopped"] = True
+                    break
+                report["series"] += 1
+                try:
+                    series = api.get_series_novel_ids(self.client, series_id)
+                except Exception as e:
+                    self.logger.warning("系列 %s 成员获取失败：%s", series_id, e)
+                    report["failed"] += 1
+                    continue
+                for nid in series.novel_ids:
+                    if self._stop_event.is_set():
+                        report["stopped"] = True
+                        break
+                    rec = self.db.get_novel(nid)
+                    if rec is None:
+                        continue  # 未收录的不管，交给正式抓取
+                    if rec.get("series_id") == series_id:
+                        continue
+                    try:
+                        self._fix_novel_series(rec, series_id, series.title)
+                        report["fixed"] += 1
+                    except Exception:
+                        self.logger.warning("作品 %s 补归系列失败", nid, exc_info=True)
+                        report["failed"] += 1
+        self.logger.info("重新归类完成：%d 位作者 / %d 个系列 / 补归 %d 部 / 失败 %d",
+                         report["authors"], report["series"],
+                         report["fixed"], report["failed"])
+        return report
 
     def _migrate_filenames(self, author_id: str = None):
         """按当前命名规则重命名 EPUB。

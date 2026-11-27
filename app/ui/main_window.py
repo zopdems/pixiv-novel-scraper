@@ -30,7 +30,7 @@ from .icons import app_mark, icon
 from .ranking_page import RankingPageMixin
 from .theme import apply_theme, current_mode, resolve_mode, tokens
 from .worker import (AuthorCheckWorker, DryRunWorker, RebuildMdWorker,
-                     ScrapeWorker, SingleWorkWorker)
+                     ReclassifyWorker, ScrapeWorker, SingleWorkWorker)
 
 _AUTHOR_ID_RE = re.compile(r"^\d+$")
 
@@ -104,6 +104,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.worker = None
         self.md_worker = None
         self.rank_worker = None
+        self.reclassify_worker = None
         self.last_report = None
         try:
             self.rank_db = RankDatabase(os.path.join(app_data_dir(), "rank.db"), logger)
@@ -307,6 +308,12 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.btn_rebuild_md.setToolTip("按当前设置重新生成全部作者的 Markdown 索引（不联网、不重新下载作品）")
         self.btn_rebuild_md.clicked.connect(self.rebuild_md_index)
 
+        self.btn_reclassify = QPushButton("重新归类系列")
+        self.btn_reclassify.setToolTip(
+            "联网查一遍所有小说作者的系列，把误判为「单篇」的系列作品补归系列并迁移目录。\n"
+            "不下载正文、不查作品详情，用于修复历史版本遗留的目录错乱。")
+        self.btn_reclassify.clicked.connect(self.reclassify_series)
+
         btn_open = QPushButton("打开主页")
         btn_open.clicked.connect(self.open_author_page)
         btn_toggle = QPushButton("启用 / 停用")
@@ -322,6 +329,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         btn_del.setProperty("class", "danger")
         btn_del.clicked.connect(self.delete_author)
         row.addWidget(self.btn_rebuild_md)
+        row.addWidget(self.btn_reclassify)
         row.addWidget(btn_open)
         row.addWidget(btn_toggle)
         row.addWidget(self.btn_check_author)
@@ -655,6 +663,48 @@ class MainWindow(QMainWindow, RankingPageMixin):
             f"已处理 {report.get('authors', 0)} 位作者："
             f"写入 {report.get('written', 0)} 个，失败 {report.get('failed', 0)} 个。")
 
+    def reclassify_series(self):
+        """一键重新归类全部小说系列：把误判为单篇的系列作品补归系列并迁移目录。"""
+        if not credentials.load_cookie():
+            QMessageBox.warning(self, "无法重新归类", "未配置 Cookie，请先在设置里导入。")
+            return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "提示", "已有抓取任务进行中，请稍候。")
+            return
+        if self.reclassify_worker and self.reclassify_worker.isRunning():
+            return
+        answer = QMessageBox.question(
+            self, "重新归类系列",
+            "将联网查一遍所有小说作者的系列，把误判为「单篇」的系列作品补归系列并迁移目录。\n\n"
+            "不下载正文、不查作品详情，只改索引和移动本地文件。是否继续？")
+        if answer != QMessageBox.Yes:
+            return
+        self.btn_reclassify.setEnabled(False)
+        self.btn_reclassify.setText("归类中…")
+        self.reclassify_worker = ReclassifyWorker(self.settings, self.db, self.logger, self)
+        self.reclassify_worker.finished_report.connect(self._on_reclassify_done)
+        self.reclassify_worker.start()
+
+    def _on_reclassify_done(self, report: dict):
+        self.btn_reclassify.setEnabled(True)
+        self.btn_reclassify.setText("重新归类系列")
+        r = report or {}
+        if r.get("auth_expired"):
+            _set_class(self.conn_badge, "badge-warn")
+            self.conn_badge.setText("Cookie 已失效")
+            QMessageBox.warning(self, "重新归类", "登录已失效，请重新导入 Cookie 后再试。")
+            return
+        if not r.get("ok"):
+            QMessageBox.warning(self, "重新归类", f"失败：{r.get('error')}")
+            return
+        if r.get("stopped"):
+            msg = f"已中止：处理 {r.get('authors', 0)} 位作者，补归 {r.get('fixed', 0)} 部，失败 {r.get('failed', 0)} 个。"
+        else:
+            msg = (f"完成：{r.get('authors', 0)} 位作者 / {r.get('series', 0)} 个系列，"
+                   f"补归 {r.get('fixed', 0)} 部，失败 {r.get('failed', 0)} 个。")
+        QMessageBox.information(self, "重新归类", msg)
+        self.refresh_authors()
+
     def _fill_deleted_tree(self):
         tree = self.deleted_tree
         tk = tokens(current_mode())
@@ -970,6 +1020,13 @@ class MainWindow(QMainWindow, RankingPageMixin):
 
     def start_fetch(self):
         if self.worker and self.worker.isRunning():
+            return
+        # 重新归类 / 重建索引也在联网或写库，必须互斥，避免并发请求触发风控
+        if self.reclassify_worker and self.reclassify_worker.isRunning():
+            QMessageBox.information(self, "提示", "正在重新归类系列，请稍候。")
+            return
+        if self.md_worker and self.md_worker.isRunning():
+            QMessageBox.information(self, "提示", "正在重建索引，请稍候。")
             return
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)

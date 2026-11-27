@@ -163,6 +163,45 @@ class DryRunWorker(QThread):
             self.finished_report.emit({"ok": False, "error": str(e)})
 
 
+class ReclassifyWorker(QThread):
+    """一键重新归类全部小说系列（不下载正文）。"""
+
+    finished_report = Signal(object)
+
+    def __init__(self, settings, db, logger, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.db = db
+        self.logger = logger
+        self.engine = None
+
+    def stop(self):
+        if self.engine:
+            self.engine.request_stop()
+
+    def run(self):
+        from ..pixiv.client import AuthExpiredError
+        try:
+            self.engine = ScraperEngine(self.settings, self.db, load_cookie(),
+                                        self.logger)
+            report = self.engine.reclassify_series()
+            report["ok"] = True
+        except AuthExpiredError:
+            self.logger.error("重新归类中止：登录已失效")
+            report = {"ok": False, "auth_expired": True,
+                      "error": "登录已失效，请重新导入 Cookie"}
+        except Exception as e:
+            self.logger.error("重新归类异常：%s", e, exc_info=True)
+            report = {"ok": False, "error": str(e)}
+        finally:
+            if self.engine:
+                try:
+                    self.engine.client.close()
+                except Exception:
+                    pass
+        self.finished_report.emit(report)
+
+
 class RebuildMdWorker(QThread):
     """离线重建全部作者的 Markdown 索引（不联网）。"""
 
