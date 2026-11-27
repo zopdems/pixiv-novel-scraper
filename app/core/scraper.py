@@ -344,9 +344,48 @@ class ScraperEngine:
             self._finish_author_stat(stat, aid)
             return
 
+        # ---- 拉取系列成员，合并进 remote_ids ----
+        # profile/all 的 novels 字段只含「单篇」，系列作品在 novelSeries 字段。
+        # 不合并的话：① 下面删除判定会把所有系列作品误标「远端已删除」；
+        # ② 系列里的新作品永远不会被发现。
+        # 系列来源两处：本地已收录作品的 series_id + profile/all 的 novelSeries。
+        series_contents = {}   # series_id -> SeriesContent（本次成功轮询到的系列）
+        series_ids = set(self.db.series_ids_by_author(aid))
+        try:
+            series_ids |= set(api.get_user_series_ids(self.client, aid))
+        except Exception as e:
+            self.logger.warning("作者 %s 系列列表获取失败：%s", aid, e)
+        for series_id in sorted(series_ids, key=int):
+            self._guard_failures()
+            if not self.db.should_poll_series(
+                    series_id, self._cfg_int("series_recheck_days", SERIES_RECHECK_DAYS)):
+                continue
+            try:
+                series = api.get_series_novel_ids(self.client, series_id)
+            except PixivRequestError as e:
+                if e.kind == "not_found":
+                    self.db.mark_series_deleted(series_id, aid)
+                    stat["series_deleted"] += 1
+                    self.logger.info("系列 %s 已不存在（404），标记为已删除，%d 天后重试", series_id, SERIES_RECHECK_DAYS)
+                else:
+                    self.logger.warning("系列 %s 轮询失败：%s", series_id, e)
+                continue
+            except Exception as e:
+                self.logger.warning("系列 %s 轮询失败：%s", series_id, e)
+                continue
+            self.db.unmark_series_deleted(series_id)
+            series_contents[series_id] = series
+            remote_ids.update(series.novel_ids)
+
         local_map = {n["novel_id"]: n for n in self.db.novels_by_author(aid)}
+        # 复查期内被跳过轮询的系列（已标删除未到复查期）：成员无法确认远端
+        # 状态，不参与删除判定，避免把它们的已下载作品误标删除。
+        skipped_series = series_ids - set(series_contents.keys())
         if self._cfg("remote_deleted_action", "keep") == "keep":
             for nid, rec in local_map.items():
+                sid = rec.get("series_id") or ""
+                if nid not in remote_ids and sid in skipped_series:
+                    continue
                 if nid not in remote_ids and rec["status"] in (Status.OK, Status.OUTDATED):
                     self.db.set_novel_status(nid, Status.DELETED)
                     stat["deleted"] += 1
@@ -379,35 +418,15 @@ class ScraperEngine:
             if name and not remote_name:
                 remote_name = name
 
-        # 系列来源两处：① 本地已收录作品的 series_id；② profile/all 的 novelSeries。
-        # 只依赖本地库会导致「系列里的作品从未被单独收录」时系列完全不被轮询。
-        series_ids = set(self.db.series_ids_by_author(aid))
-        try:
-            series_ids |= set(api.get_user_series_ids(self.client, aid))
-        except Exception as e:
-            self.logger.warning("作者 %s 系列列表获取失败：%s", aid, e)
-        for series_id in sorted(series_ids, key=int):
-            self._guard_failures()
-            if not self.db.should_poll_series(
-                    series_id, self._cfg_int("series_recheck_days", SERIES_RECHECK_DAYS)):
-                continue
-            try:
-                series = api.get_series_novel_ids(self.client, series_id)
-            except PixivRequestError as e:
-                if e.kind == "not_found":
-                    self.db.mark_series_deleted(series_id, aid)
-                    stat["series_deleted"] += 1
-                    self.logger.info("系列 %s 已不存在（404），标记为已删除，%d 天后重试", series_id, SERIES_RECHECK_DAYS)
-                else:
-                    self.logger.warning("系列 %s 轮询失败：%s", series_id, e)
-                continue
-            except Exception as e:
-                self.logger.warning("系列 %s 轮询失败：%s", series_id, e)
-                continue
-            self.db.unmark_series_deleted(series_id)
+        # ---- 系列收尾：补归（series_id 缺失/不一致）+ OUTDATED 重下 ----
+        # 作品是否属于系列以「系列接口的成员名单」为准：详情接口的 seriesNavData
+        # 偶发为空，会让系列小说被误判成单篇，这里按系列成员名单修正。
+        for series_id, series in series_contents.items():
             for nid in series.novel_ids:
                 rec = self.db.get_novel(nid)
-                if rec is None or rec["status"] == Status.OUTDATED:
+                if rec is None:
+                    continue  # 理论上 remote_ids 已含全部成员，防御性跳过
+                if rec["status"] == Status.OUTDATED:
                     name = self._process_novel(nid, aid, stat=stat)
                     if name and not remote_name:
                         remote_name = name

@@ -26,6 +26,7 @@ from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
                             STATUS_TOKEN, author_display_name,
                             decorate_name_item, resolve_author_status,
                             status_text)
+from .flow_layout import FlowLayout
 from .icons import app_mark, icon
 from .ranking_page import RankingPageMixin
 from .theme import apply_theme, current_mode, resolve_mode, tokens
@@ -285,8 +286,8 @@ class MainWindow(QMainWindow, RankingPageMixin):
             "作者管理", "维护需要同步的小说 / 插画作者名单，双击昵称可打开 Pixiv 主页")
 
         bar, bl = self._card(margin=12, spacing=8)
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        # 按钮多，用自动换行的 FlowLayout：窄窗口下折行而不是挤压重叠
+        row = FlowLayout(spacing=8)
 
         self.author_input = QLineEdit()
         self.author_input.setPlaceholderText("作者数字 ID，或粘贴 pixiv.net/users/… 主页链接")
@@ -302,7 +303,6 @@ class MainWindow(QMainWindow, RankingPageMixin):
         row.addWidget(self.author_input)
         row.addWidget(btn_add)
         row.addWidget(btn_batch)
-        row.addStretch(1)
 
         self.btn_rebuild_md = QPushButton("重建索引")
         self.btn_rebuild_md.setToolTip("按当前设置重新生成全部作者的 Markdown 索引（不联网、不重新下载作品）")
