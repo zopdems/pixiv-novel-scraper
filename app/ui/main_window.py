@@ -513,15 +513,23 @@ class MainWindow(QMainWindow, RankingPageMixin):
             return
         label = "小说" if kind == "novel" else "插画"
         aids = self._selected_author_ids()
-        if not aids:
-            authors = self.db.list_authors(kind=kind)
-            if not authors:
-                QMessageBox.information(self, "提示", f"{label}名单里还没有作者。")
+        authors = self.db.list_authors(kind=kind)
+        if not authors:
+            QMessageBox.information(self, "提示", f"{label}名单里还没有作者。")
+            return
+        if aids:
+            # 选中了作者：明确告知只检查选中的，避免用户误以为会检查全部
+            tip = (f"将只检查选中的 {len(aids)} 位作者（{label}名单共 {len(authors)} 位）。\n"
+                   f"想检查全部请先取消选择（点空白处或按 Esc）。\n\n是否继续？")
+            msg = QMessageBox.question(self, "检查账号状态", tip)
+            if msg == QMessageBox.No:
                 return
-            if QMessageBox.question(
-                    self, "检查账号状态",
-                    f"没有选中任何行。要检查{label}名单里的全部 {len(authors)} 位作者吗？\n"
-                    f"每位作者会查询一次 Pixiv，数量较多时请注意风控。") != QMessageBox.Yes:
+            elif msg == QMessageBox.Cancel:
+                return
+        else:
+            tip = (f"要检查{label}名单里的全部 {len(authors)} 位作者吗？\n"
+                   f"每位作者会查询一次 Pixiv，数量较多时请注意风控。")
+            if QMessageBox.question(self, "检查账号状态", tip) != QMessageBox.Yes:
                 return
             aids = [a["author_id"] for a in authors]
         self.btn_check_author.setEnabled(False)
@@ -938,6 +946,11 @@ class MainWindow(QMainWindow, RankingPageMixin):
                 _it = _tbl.item(_row, 1)
                 if _it and _it.text() == _aid:
                     _tbl.setCurrentCell(_row, 0)
+                    # 关键：setCurrentCell 会「选中」该行，导致「检查账号状态」
+                    # 误以为用户只选了这一位、从而只检查一位且不弹确认框。
+                    # 清掉选择，只保留当前行（currentRow 仍有效），
+                    # 「检查账号状态」就走「未选中 → 询问是否检查全部」分支。
+                    _tbl.clearSelection()
                     break
         try:
             self._fill_deleted_tree()
