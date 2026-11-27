@@ -506,20 +506,25 @@ class ScraperEngine:
     def reclassify_series(self) -> dict:
         """一键重新归类全部小说系列（不下载正文、不查作品详情）。
 
-        遍历所有小说作者 → 从 profile/all 拉远端系列列表 → 逐个系列拉成员，
-        把本地 series_id 缺失/不一致的作品补归系列并迁移目录。
+        分两阶段：先扫描所有作者的系列列表（阶段 1，按作者报进度），
+        再逐个系列拉成员并补归（阶段 2，按系列报进度）。
         用于修复历史版本遗留的「单篇/系列目录错乱」。
         返回 {"authors": n, "series": n, "fixed": n, "failed": n, "stopped": bool}
         """
         report = {"authors": 0, "series": 0, "fixed": 0, "failed": 0, "stopped": False}
         authors = self.db.list_authors(enabled_only=True, kind="novel")
-        self.logger.info("重新归类系列：共 %d 位小说作者", len(authors))
-        for author in authors:
+
+        # ---- 阶段 1：扫描系列列表，收集 (author_id, series_id) 任务 ----
+        tasks = []  # [(author_id, series_id), ...]
+        self._emit("reclassify_scope", phase="scan", total=len(authors))
+        for i, author in enumerate(authors):
             if self._stop_event.is_set():
                 report["stopped"] = True
                 break
             aid = author["author_id"]
             report["authors"] += 1
+            self._emit("reclassify_progress", phase="scan", done=i + 1,
+                       total=len(authors), label=author.get("author_name") or aid)
             try:
                 remote_series = set(api.get_user_series_ids(self.client, aid))
             except AuthExpiredError:
@@ -529,31 +534,40 @@ class ScraperEngine:
                 report["failed"] += 1
                 continue
             for series_id in sorted(remote_series, key=int):
+                tasks.append((aid, series_id))
+
+        # ---- 阶段 2：逐个系列拉成员 + 补归 ----
+        total_series = len(tasks)
+        self._emit("reclassify_scope", phase="process", total=total_series)
+        for idx, (aid, series_id) in enumerate(tasks):
+            if self._stop_event.is_set():
+                report["stopped"] = True
+                break
+            report["series"] += 1
+            self._emit("reclassify_progress", phase="process", done=idx + 1,
+                       total=total_series, label=f"系列 {series_id}")
+            try:
+                series = api.get_series_novel_ids(self.client, series_id)
+            except Exception as e:
+                self.logger.warning("系列 %s 成员获取失败：%s", series_id, e)
+                report["failed"] += 1
+                continue
+            for nid in series.novel_ids:
                 if self._stop_event.is_set():
                     report["stopped"] = True
                     break
-                report["series"] += 1
-                try:
-                    series = api.get_series_novel_ids(self.client, series_id)
-                except Exception as e:
-                    self.logger.warning("系列 %s 成员获取失败：%s", series_id, e)
-                    report["failed"] += 1
+                rec = self.db.get_novel(nid)
+                if rec is None:
+                    continue  # 未收录的不管，交给正式抓取
+                if rec.get("series_id") == series_id:
                     continue
-                for nid in series.novel_ids:
-                    if self._stop_event.is_set():
-                        report["stopped"] = True
-                        break
-                    rec = self.db.get_novel(nid)
-                    if rec is None:
-                        continue  # 未收录的不管，交给正式抓取
-                    if rec.get("series_id") == series_id:
-                        continue
-                    try:
-                        self._fix_novel_series(rec, series_id, series.title)
-                        report["fixed"] += 1
-                    except Exception:
-                        self.logger.warning("作品 %s 补归系列失败", nid, exc_info=True)
-                        report["failed"] += 1
+                try:
+                    self._fix_novel_series(rec, series_id, series.title)
+                    report["fixed"] += 1
+                except Exception:
+                    self.logger.warning("作品 %s 补归系列失败", nid, exc_info=True)
+                    report["failed"] += 1
+
         self.logger.info("重新归类完成：%d 位作者 / %d 个系列 / 补归 %d 部 / 失败 %d",
                          report["authors"], report["series"],
                          report["fixed"], report["failed"])

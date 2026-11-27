@@ -335,6 +335,25 @@ class MainWindow(QMainWindow, RankingPageMixin):
         row.addWidget(self.btn_check_author)
         row.addWidget(btn_del)
         bl.addLayout(row)
+
+        # 重新归类进度行（默认隐藏，运行重新归类时显示）
+        rc_row = QHBoxLayout()
+        rc_row.setSpacing(8)
+        self.reclassify_progress = QProgressBar()
+        self.reclassify_progress.setRange(0, 0)
+        self.reclassify_progress.setTextVisible(False)
+        self.reclassify_progress.setVisible(False)
+        self.reclassify_label = QLabel("")
+        self.reclassify_label.setProperty("class", "hint")
+        self.reclassify_label.setVisible(False)
+        self.btn_reclassify_stop = QPushButton("中止归类")
+        self.btn_reclassify_stop.setProperty("class", "danger")
+        self.btn_reclassify_stop.setVisible(False)
+        self.btn_reclassify_stop.clicked.connect(self.stop_reclassify)
+        rc_row.addWidget(self.reclassify_label)
+        rc_row.addWidget(self.reclassify_progress, 1)
+        rc_row.addWidget(self.btn_reclassify_stop)
+        bl.addLayout(rc_row)
         outer.addWidget(bar)
 
         table_card, tl = self._card(margin=12, spacing=8)
@@ -681,13 +700,48 @@ class MainWindow(QMainWindow, RankingPageMixin):
             return
         self.btn_reclassify.setEnabled(False)
         self.btn_reclassify.setText("归类中…")
+        self._show_reclassify_progress(True)
         self.reclassify_worker = ReclassifyWorker(self.settings, self.db, self.logger, self)
+        self.reclassify_worker.progress.connect(self._on_reclassify_progress)
         self.reclassify_worker.finished_report.connect(self._on_reclassify_done)
         self.reclassify_worker.start()
 
+    def _show_reclassify_progress(self, visible: bool):
+        self.reclassify_progress.setVisible(visible)
+        self.reclassify_label.setVisible(visible)
+        self.btn_reclassify_stop.setVisible(visible)
+
+    def _on_reclassify_progress(self, event: dict):
+        phase = event.get("phase")
+        total = int(event.get("total") or 0)
+        done = int(event.get("done") or 0)
+        label = event.get("label") or ""
+        if phase == "scan":
+            if total > 0:
+                self.reclassify_progress.setRange(0, total)
+                self.reclassify_progress.setTextVisible(True)
+            self.reclassify_label.setText(f"正在扫描作者 {done}/{total}：{label}")
+        elif phase == "process":
+            self.reclassify_progress.setRange(0, total)
+            self.reclassify_progress.setTextVisible(True)
+            self.reclassify_label.setText(f"正在归类系列 {done}/{total}：{label}")
+        self.reclassify_progress.setValue(done)
+        self.reclassify_progress.setFormat(f"{done}/{total}")
+
+    def stop_reclassify(self):
+        if self.reclassify_worker and self.reclassify_worker.isRunning():
+            self.reclassify_worker.stop()
+            self.btn_reclassify_stop.setEnabled(False)
+            self.btn_reclassify_stop.setText("正在中止…")
+
     def _on_reclassify_done(self, report: dict):
+        self._show_reclassify_progress(False)
         self.btn_reclassify.setEnabled(True)
         self.btn_reclassify.setText("重新归类系列")
+        self.btn_reclassify_stop.setEnabled(True)
+        self.btn_reclassify_stop.setText("中止归类")
+        self.reclassify_progress.setRange(0, 0)
+        self.reclassify_progress.setTextVisible(False)
         r = report or {}
         if r.get("auth_expired"):
             _set_class(self.conn_badge, "badge-warn")

@@ -166,6 +166,7 @@ class DryRunWorker(QThread):
 class ReclassifyWorker(QThread):
     """一键重新归类全部小说系列（不下载正文）。"""
 
+    progress = Signal(dict)
     finished_report = Signal(object)
 
     def __init__(self, settings, db, logger, parent=None):
@@ -183,7 +184,7 @@ class ReclassifyWorker(QThread):
         from ..pixiv.client import AuthExpiredError
         try:
             self.engine = ScraperEngine(self.settings, self.db, load_cookie(),
-                                        self.logger)
+                                        self.logger, progress_cb=self.progress.emit)
             report = self.engine.reclassify_series()
             report["ok"] = True
         except AuthExpiredError:
