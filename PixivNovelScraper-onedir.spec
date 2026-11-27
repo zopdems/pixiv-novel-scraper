@@ -61,9 +61,10 @@ _UNUSED_DLL = (
 )
 binaries = [b for b in binaries
             if not any(b[0].startswith(n) for n in _UNUSED_DLL)]
-# 排除 numpy / PIL 的 Python 模块与数据
+# 排除 numpy / PIL / jedi 的 Python 模块与数据
 excluded_modules = [
     'numpy', 'numpy.*', 'PIL', 'PIL.*',
+    'jedi', 'jedi.*',       # 代码补全库，app 不引用，且自带超长路径的 django-stubs 会让 NSIS 失败
 ]
 
 
