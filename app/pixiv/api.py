@@ -78,19 +78,29 @@ def get_user_name(client: PixivClient, user_id: str) -> str:
 def get_user_status(client: PixivClient, user_id: str) -> tuple:
     """查询作者是否仍然存在，返回 (exists: bool, name: str)。
 
-    已注销 / 不存在的账号，该接口会返回 HTTP 404 且
+    已注销 / 不存在的账号，该接口会返回 HTTP 404 或
     error=true、提示「该用户已离开 pixiv 或该 ID 不存在」。
 
     注意：不能用 profile/all 判断是否注销——已注销账号的 profile/all
     仍会返回 HTTP 200，只是各作品列表为空，无法与「零作品的新账号」区分。
+
+    实现上必须绕过 client.get_json()：它遇到 error=true 会提前抛
+    PixivRequestError(kind="api")，把「已注销」误当成「接口错误」向上抛，
+    导致 _ensure_author_alive 记成「检查失败」而放过。这里直接用 request
+    拿原始响应、自行解析 error 字段。
     """
     try:
-        data = client.get_json(f"{client.BASE}/ajax/user/{user_id}?lang=zh")
+        resp = client.request("GET", f"{client.BASE}/ajax/user/{user_id}?lang=zh")
     except PixivRequestError as e:
         if e.kind == "not_found":
             return False, ""
         raise
-    if data.get("error"):
+    try:
+        data = resp.json()
+    except ValueError:
+        # 响应不是 JSON：极可能是账号异常，但不贸然判注销，交给上层按正常处理
+        return True, ""
+    if isinstance(data, dict) and data.get("error"):
         return False, ""
     body = data.get("body") or {}
     if not body or not (body.get("userId") or body.get("name")):
