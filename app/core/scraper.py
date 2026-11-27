@@ -379,8 +379,14 @@ class ScraperEngine:
             if name and not remote_name:
                 remote_name = name
 
-        series_ids = self.db.series_ids_by_author(aid)
-        for series_id in series_ids:
+        # 系列来源两处：① 本地已收录作品的 series_id；② profile/all 的 novelSeries。
+        # 只依赖本地库会导致「系列里的作品从未被单独收录」时系列完全不被轮询。
+        series_ids = set(self.db.series_ids_by_author(aid))
+        try:
+            series_ids |= set(api.get_user_series_ids(self.client, aid))
+        except Exception as e:
+            self.logger.warning("作者 %s 系列列表获取失败：%s", aid, e)
+        for series_id in sorted(series_ids, key=int):
             self._guard_failures()
             if not self.db.should_poll_series(
                     series_id, self._cfg_int("series_recheck_days", SERIES_RECHECK_DAYS)):
@@ -405,6 +411,11 @@ class ScraperEngine:
                     name = self._process_novel(nid, aid, stat=stat)
                     if name and not remote_name:
                         remote_name = name
+                elif rec.get("series_id") != series_id:
+                    # 已下载但 series_id 缺失/不一致（此前被误判成单篇，或作品
+                    # 后来被作者归入系列）：补齐系列信息并迁移目录。
+                    self._fix_novel_series(rec, series_id, series.title)
+                    stat["updated"] += 1
 
         # 「系列全部 404」是个强信号：这类作者单篇列表往往还有返回（于是不会触发
         # 上面的零作品检查），但系列分组已经全没了，账号多半已注销。这里补查一次
@@ -430,6 +441,43 @@ class ScraperEngine:
         self._refresh_author_md(aid, stat)
         self._merge_stat(stat, aid)
         self._emit_author_done(aid, stat)
+
+    def _fix_novel_series(self, rec: dict, series_id: str, series_title: str):
+        """把一部已下载作品补上系列信息，并迁移文件目录。
+
+        场景：作品首次抓取时 series_id 为空（被归到「单篇」目录），
+        后来作者把它收进系列；或系列轮询补到了之前漏掉的系列成员。
+        此时不应重新下载正文，只需改索引 + 迁移 EPUB 目录。
+        """
+        old_path = rec.get("local_path") or ""
+        self.db.upsert_novel({
+            "novel_id": rec["novel_id"],
+            "series_id": series_id,
+            "series_title": series_title,
+        })
+        if not old_path or not os.path.exists(old_path):
+            return
+        updated = dict(rec)
+        updated["series_id"] = series_id
+        updated["series_title"] = series_title
+        desired = paths.novel_path(self.settings.epub_root, updated,
+                                   self.settings.name_pattern, self.popts)
+        desired = paths.resolve_collision(desired, updated, old_path)
+        if os.path.abspath(desired) == os.path.abspath(old_path):
+            return
+        try:
+            os.makedirs(os.path.dirname(desired), exist_ok=True)
+            os.rename(old_path, desired)
+            self.db.upsert_novel({"novel_id": rec["novel_id"], "local_path": desired})
+            self.logger.info("作品 %s 补归系列 %s：%s -> %s",
+                             rec["novel_id"], series_id,
+                             os.path.basename(old_path), os.path.basename(desired))
+            try:
+                os.removedirs(os.path.dirname(old_path))
+            except OSError:
+                pass
+        except OSError:
+            self.logger.warning("作品 %s 迁移到系列目录失败", rec["novel_id"], exc_info=True)
 
     def _migrate_filenames(self, author_id: str = None):
         """按当前命名规则重命名 EPUB。

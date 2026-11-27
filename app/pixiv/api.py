@@ -43,6 +43,28 @@ def get_user_profile_ids(client: PixivClient, user_id: str) -> tuple:
     return sorted(novel_ids, key=int), sorted(illust_ids, key=int)
 
 
+def get_user_series_ids(client: PixivClient, user_id: str) -> list:
+    """从 profile/all 取该用户的小说系列 ID 列表。
+
+    profile/all 的 body.novels 只包含「单篇」小说；系列里的作品单独放在
+    body.novelSeries 字段（key 是 series_id）。旧实现只看 novels，导致
+    系列作品根本没被发现——作者几百篇小说只下到零星的单篇。
+    """
+    data = client.get_json(f"{client.BASE}/ajax/user/{user_id}/profile/all?lang=zh")
+    body = data.get("body") or {}
+
+    def _pick(key):
+        group = body.get(key) or {}
+        # novelSeries 可能是 dict（key=series_id）也可能是 list（元素是 dict/id）
+        if isinstance(group, dict):
+            raw = group.keys()
+        else:
+            raw = [x.get("id") if isinstance(x, dict) else x for x in group]
+        return {str(x) for x in raw if str(x).isdigit()}
+
+    return sorted(_pick("novelSeries"), key=int)
+
+
 def get_user_novel_ids(client: PixivClient, user_id: str) -> list:
     return get_user_profile_ids(client, user_id)[0]
 
