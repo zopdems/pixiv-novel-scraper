@@ -283,8 +283,8 @@ class AuthorCheckWorker(QThread):
                         result["unknown"].append({"aid": aid, "kind": kind, "reason": str(e)})
                         continue
                     if not exists:
-                        self.db.set_author_enabled(aid, False, kind=kind,
-                                                   reason=DISABLE_REASON_DEACTIVATED)
+                        # 账号注销是全局的：同一账号的小说、插画名单一并停用
+                        self.db.deactivate_author_all_kinds(aid)
                         result["deactivated"].append({"aid": aid, "kind": kind})
                         continue
                     if name:

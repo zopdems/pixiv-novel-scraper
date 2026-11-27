@@ -228,8 +228,8 @@ class ScraperEngine:
         """作者账号已注销 / 不存在时，按 author_404_action 处理。"""
         action = str(self._cfg("author_404_action", "disable"))
         if action == "disable":
-            self.db.set_author_enabled(aid, False, kind=kind,
-                                       reason=DISABLE_REASON_DEACTIVATED)
+            # 账号注销是全局的：同一账号的小说、插画名单一并停用
+            self.db.deactivate_author_all_kinds(aid)
             self.logger.warning(
                 "作者 %s（%s）账号已注销或不存在，已自动停用，本地作品保留",
                 aid, author.get("author_name") or "",

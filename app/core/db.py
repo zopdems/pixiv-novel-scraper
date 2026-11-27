@@ -321,6 +321,18 @@ class Database:
                 " WHERE author_id=? AND kind=?",
                 (int(enabled), self._now(), reason or "", author_id, kind))
 
+    def deactivate_author_all_kinds(self, author_id: str) -> None:
+        """因「账号已注销」停用该作者在所有名单（小说 + 插画）的记录。
+
+        账号注销是全局的：同一个 Pixiv 账号注销后，小说和插画都不存在了。
+        只停用单一 kind 会导致「已删除作品」等跨 kind 展示处状态不一致——
+        例如小说名单判了注销，但插画名单仍显示正常。
+        """
+        self._execute(
+            "UPDATE authors SET enabled=0, disabled_at=?, disabled_reason=?"
+            " WHERE author_id=?",
+            (self._now(), DISABLE_REASON_DEACTIVATED, author_id))
+
     def author_disable_reason(self, author_id: str, kind: str = "novel") -> str:
         row = self._query_one(
             "SELECT disabled_reason FROM authors WHERE author_id=? AND kind=?",
@@ -348,7 +360,8 @@ class Database:
 
     def reenable_author(self, author_id: str, kind: str) -> None:
         self._execute(
-            "UPDATE authors SET enabled=1, disabled_at=NULL WHERE author_id=? AND kind=?",
+            "UPDATE authors SET enabled=1, disabled_at=NULL, disabled_reason=NULL"
+            " WHERE author_id=? AND kind=?",
             (author_id, kind))
 
     def update_author_name(self, author_id: str, name: str, kind: str = None):

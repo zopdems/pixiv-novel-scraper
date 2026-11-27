@@ -20,6 +20,7 @@ from ..core.db import DISABLE_REASON_MANUAL
 from ..core.models import STATUS_LABELS, Status, status_label
 from ..core.rank_db import R18_MODES, RANK_MODES, RankDatabase, mode_label
 from ..core.utils import extract_author_id
+from ..version import __version__
 from ..pixiv.client import PixivClient
 from .author_status import (AUTHOR_DELETED_LABEL, AUTHOR_STATUS_ACTIVE,
                             AUTHOR_STATUS_DELETED, AUTHOR_STATUS_UNKNOWN,
@@ -115,7 +116,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         self.on_ranking_done = None
         self.on_theme_changed = None
 
-        self.setWindowTitle("Pixiv 小说抓取器")
+        self.setWindowTitle(f"Pixiv 小说抓取器 v{__version__}")
         self.resize(1140, 740)
         # 最小尺寸别给太小：高 DPI 缩放下内容需要更多像素，太窄会挤到文字显示不全
         self.setMinimumSize(1024, 660)
@@ -175,7 +176,7 @@ class MainWindow(QMainWindow, RankingPageMixin):
         title = QLabel("Pixiv 小说抓取器")
         title.setProperty("class", "page-title")
         title.setStyleSheet("font-size: 15px;")
-        subtitle = QLabel("小说 / 插画 本地同步")
+        subtitle = QLabel(f"小说 / 插画 本地同步 · v{__version__}")
         subtitle.setProperty("class", "page-sub")
         tv = QVBoxLayout()
         tv.setSpacing(1)
